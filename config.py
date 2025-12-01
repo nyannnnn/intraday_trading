@@ -12,7 +12,6 @@ UNIVERSE = [
     "CRCG",
     "CRCA",
     "CCUP",
-    "TMC",
     "ONMD",
     "BEX",
     "PAPL",
