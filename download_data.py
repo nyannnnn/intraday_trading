@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from intraday_trading.config import UNIVERSE, DATA_DIR, BAR_INTERVAL_MIN
+from config import UNIVERSE, DATA_DIR, BAR_INTERVAL_MIN
 
 
 def get_yf_interval(bar_minutes: int) -> str:

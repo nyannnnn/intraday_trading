@@ -7,15 +7,14 @@ from pathlib import Path
 # =====================
 
 UNIVERSE = [
-    "VEEE",
-    "CMCT",
-    "CRCG",
-    "CRCA",
-    "CCUP",
-    "ONMD",
-    "BEX",
-    "PAPL",
-    "BNC",
+    "BYND",
+    "CNCK",
+    "QBTS",
+    "RR",
+    "QTTB",
+    "FTEL",
+    "FLYE",
+    "AHMA",
 ]
 
 BAR_INTERVAL_MIN = 5             # 5-minute bars
@@ -27,10 +26,10 @@ LABEL_UP_THRESHOLD = 0.0075      # +0.75% threshold for "up" label
 # =====================
 
 P_UP_ENTRY_THRESHOLD = 0.70      # ML probability threshold to enter long
-MAX_CONCURRENT_POSITIONS = 4
+MAX_CONCURRENT_POSITIONS = 3
 RISK_PER_TRADE_FRACTION = 0.025  # 2.5% of equity per trade
 STOP_LOSS_PCT = 0.02             # 2% down
-TAKE_PROFIT_PCT = 0.05           # 5% up
+TAKE_PROFIT_PCT = 0.1           # 4% up
 MAX_BARS_IN_TRADE = 8            # 8 * 5min = 40min hold max
 DAILY_LOSS_STOP_FRACTION = 0.05  # stop trading if down 5% on the day
 
