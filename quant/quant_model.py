@@ -37,9 +37,9 @@ def build_features_for_symbol(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # 1-bar, 3-bar, 6-bar returns
-    df["ret_1"] = df["close"].pct_change(1)
-    df["ret_3"] = df["close"].pct_change(3)
-    df["ret_6"] = df["close"].pct_change(6)
+    df["ret_1"] = df["close"].pct_change(1, fill_method=None)
+    df["ret_3"] = df["close"].pct_change(3, fill_method=None)
+    df["ret_6"] = df["close"].pct_change(6, fill_method=None)
 
     # Rolling 60-bar volume (approx 5h on 5-min bars)
     df["vol_60"] = df["volume"].rolling(window=60, min_periods=10).mean()

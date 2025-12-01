@@ -128,9 +128,7 @@ class MLSignalModel:
 
         # Optionally persist to disk
         if save_path is not None:
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump({"config": self.cfg, "model": self.clf}, save_path)
-
+            joblib.dump(clf, save_path)
         return metrics
 
     def predict_proba(self, panel_df: pd.DataFrame) -> pd.Series:
