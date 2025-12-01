@@ -1,13 +1,33 @@
 # backtesting.py
+"""
+Offline backtest for the intraday ML model.
 
-import math
+What it does:
+-------------
+1. Loads raw OHLCV for the UNIVERSE from config.DATA_DIR.
+2. Builds features + future returns using quant.quant_model.build_panel_features_and_labels.
+3. Loads the latest trained sklearn classifier from models/.
+4. Simulates trades whenever P_up >= P_UP_ENTRY_THRESHOLD, using:
+   - fixed future horizon FUTURE_HORIZON_BARS
+   - stop-loss / take-profit clipping on future_ret
+   - position size = RISK_PER_TRADE_FRACTION * start_equity per trade
+5. Builds:
+   - ML strategy equity curve
+   - buy & hold equity curve (equal-weight across UNIVERSE)
+6. Prints metrics + trade summary and shows a plot.
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import List
 
-import joblib
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+from sklearn.metrics import roc_auc_score, accuracy_score
 
 from config import (
     UNIVERSE,
@@ -16,93 +36,87 @@ from config import (
     FEATURE_COLUMNS,
     LABEL_COLUMN,
     P_UP_ENTRY_THRESHOLD,
-    MAX_CONCURRENT_POSITIONS,
+    FUTURE_HORIZON_BARS,
+    BAR_INTERVAL_MIN,
     RISK_PER_TRADE_FRACTION,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
-    MAX_BARS_IN_TRADE,
-    FEE_PER_ORDER,
-    BAR_INTERVAL_MIN,
 )
+
 from quant.quant_model import build_panel_features_and_labels
 
 
-# =========================
-# Backtest configuration
-# =========================
-
-@dataclass
-class BacktestConfig:
-    initial_capital: float = 100_000.0
-
-    p_up_entry_threshold: float = P_UP_ENTRY_THRESHOLD
-    max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS
-    risk_per_trade_fraction: float = RISK_PER_TRADE_FRACTION
-    stop_loss_pct: float = STOP_LOSS_PCT
-    take_profit_pct: float = TAKE_PROFIT_PCT
-    max_bars_in_trade: int = MAX_BARS_IN_TRADE
-    fee_per_order: float = FEE_PER_ORDER
-
-    feature_cols: Tuple[str, ...] = tuple(FEATURE_COLUMNS)
-    label_col: str = LABEL_COLUMN
+# -------------------------------------------------------
+# Helpers: load data / model
+# -------------------------------------------------------
 
 
-# =========================
-# Data loading
-# =========================
-
-def load_panel_ohlcv(data_root: Path, universe) -> pd.DataFrame:
+def load_panel_ohlcv(data_dir: Path, universe: List[str]) -> pd.DataFrame:
     """
-    Load per-symbol OHLCV CSVs from quant/data into a panel DataFrame.
-
-    Expected CSV columns: datetime, open, high, low, close, volume
+    Load intraday OHLCV CSVs and stack into a panel:
+        index: MultiIndex [symbol, datetime]
+        columns: open, high, low, close, volume
     """
-    dfs = []
-    for symbol in universe:
-        csv_path = data_root / f"{symbol}.csv"
+    print("=== Step 1: Load raw OHLCV data ===")
+
+    frames = []
+    for sym in universe:
+        csv_path = data_dir / f"{sym}.csv"
         if not csv_path.exists():
-            print(f"[WARN] Missing CSV for {symbol}: {csv_path}")
+            print(f"[WARN] Missing CSV for {sym}: {csv_path}")
             continue
 
-        df = pd.read_csv(
-            csv_path,
-            parse_dates=["datetime"],
-        )
+        df = pd.read_csv(csv_path)
 
-        # Normalize columns
-        col_map = {c.lower(): c for c in df.columns}
-        df = df.rename(
-            columns={
-                col_map.get("open", "open"): "open",
-                col_map.get("high", "high"): "high",
-                col_map.get("low", "low"): "low",
-                col_map.get("close", "close"): "close",
-                col_map.get("volume", "volume"): "volume",
-                col_map.get("datetime", "datetime"): "datetime",
-            }
-        )
+        # Normalize column names a bit
+        df.columns = [c.lower() for c in df.columns]
+        # Heuristic: first column is timestamp-like
+        if "datetime" not in df.columns:
+            df.rename(columns={df.columns[0]: "datetime"}, inplace=True)
 
-        df = df[["datetime", "open", "high", "low", "close", "volume"]]
-        df["symbol"] = symbol
-        df = df.set_index(["symbol", "datetime"]).sort_index()
-        dfs.append(df)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime")
 
-    if not dfs:
+        # Standard OHLCV columns
+        cols = []
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in df.columns:
+                cols.append(c)
+            else:
+                raise ValueError(f"Column '{c}' missing in {csv_path}")
+
+        df = df[["datetime"] + cols]
+
+        # 🔹 Ensure numeric OHLCV (fix for float / str error)
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Drop rows where close is NaN
+        df = df.dropna(subset=["close"])
+
+        df["symbol"] = sym
+        df = df.set_index(["symbol", "datetime"])
+        frames.append(df)
+
+    if not frames:
         raise ValueError("No data frames loaded. Check DATA_DIR and UNIVERSE.")
 
-    panel = pd.concat(dfs).sort_index()
+    panel = pd.concat(frames).sort_index()
+
+    print(f"Panel OHLCV shape: {panel.shape}")
+    print(
+        "Panel OHLCV index example:",
+        panel.index[:5],
+    )
     return panel
 
 
-# =========================
-# Model loading
-# =========================
-
-def load_classifier(model_dir: Path) -> object:
+def load_latest_classifier(model_dir: Path):
     """
-    Load the trained classifier.
-    We assume train_ml.py saved ONLY the classifier object as 'intraday_gbm.joblib'.
+    Load the most recent .pkl sklearn classifier from MODEL_DIR.
+    This should be exactly what train_ml.py saved.
     """
+    model_dir = Path(model_dir)
     model_path = model_dir / "intraday_gbm.joblib"
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -111,225 +125,350 @@ def load_classifier(model_dir: Path) -> object:
     return clf
 
 
-# =========================
+# -------------------------------------------------------
+# Buy & hold benchmark
+# -------------------------------------------------------
+
+
+def build_buy_and_hold_equity(
+    panel_ohlcv: pd.DataFrame, start_equity: float
+) -> pd.Series:
+    """
+    Build an equal-weight buy & hold benchmark across the UNIVERSE.
+
+    - At the first timestamp we see for each symbol, we invest
+      start_equity / N into that symbol.
+    - Then we just hold through the entire history.
+    """
+    # panel_ohlcv: MultiIndex [symbol, datetime] -> columns incl. 'close'
+    close_df = (
+        panel_ohlcv["close"]
+        .unstack("symbol")
+        .sort_index()
+        .ffill()
+        .dropna(how="all")
+    )
+
+    # 🔹 Ensure close prices are numeric (fix for float / str error)
+    close_df = close_df.apply(pd.to_numeric, errors="coerce")
+    close_df = close_df.dropna(how="all")
+
+    # For symbols that have some data, compute initial weight
+    first_prices = close_df.iloc[0]
+    first_prices = pd.to_numeric(first_prices, errors="coerce")
+
+    valid_syms = first_prices.dropna().index
+    if len(valid_syms) == 0:
+        raise ValueError("No valid symbols for buy & hold benchmark.")
+
+    alloc_per_symbol = start_equity / len(valid_syms)
+    shares = alloc_per_symbol / first_prices[valid_syms]
+
+    # Only keep valid symbols
+    close_df = close_df[valid_syms]
+
+    equity_bh = (close_df * shares).sum(axis=1)
+    equity_bh.name = "buy_hold_equity"
+    return equity_bh
+
+
+# -------------------------------------------------------
 # Backtest core
-# =========================
+# -------------------------------------------------------
 
-def run_backtest(panel_with_features: pd.DataFrame,
-                 clf,
-                 cfg: BacktestConfig) -> Tuple[pd.DataFrame, Dict[str, float]]:
+
+@dataclass
+class BacktestResult:
+    equity: pd.Series
+    buy_hold_equity: pd.Series
+    trades: pd.DataFrame
+    metrics: dict
+
+
+def run_backtest(
+    panel_with_features: pd.DataFrame,
+    panel_ohlcv: pd.DataFrame,
+    clf,
+    start_equity: float = 100_000.0,
+) -> BacktestResult:
     """
-    Simple multi-symbol long-only backtest driven by ML probability of 'up'.
+    Offline "one-shot" backtest.
 
-    We iterate over (symbol, datetime) rows in time order, keep track of
-    open positions per symbol, and update equity over time.
+    For each (symbol, datetime) row:
+      - Compute P_up from classifier.
+      - If P_up >= P_UP_ENTRY_THRESHOLD, we 'take' a trade.
+      - The realized return for that trade is future_ret, but clipped
+        between STOP_LOSS_PCT and TAKE_PROFIT_PCT.
+      - Position size per trade is RISK_PER_TRADE_FRACTION * start_equity.
+      - PnL realized at an approximate exit_dt = entry_dt + FUTURE_HORIZON * bar.
+
+    This does NOT simulate overlapping capital usage precisely; it's an
+    *offline* evaluation of whether the ML signal has edge.
     """
 
-    # Ensure sorted by time then symbol
-    panel = panel_with_features.sort_index(level=["datetime", "symbol"])
+    print("=== Step 4: Run backtest ===")
 
-    # Dictionaries to track positions and last prices
-    positions: Dict[str, Dict[str, float]] = {}
-    last_price: Dict[str, float] = {}
+    df = panel_with_features.copy()
 
-    cash = cfg.initial_capital
+    # Ensure we have needed columns
+    needed = FEATURE_COLUMNS + ["future_ret", LABEL_COLUMN]
+    for col in needed:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' missing in panel_with_features.")
 
-    equity_list = []
-    dt_list = []
+    # Drop any rows with missing features or future_ret
+    df = df.dropna(subset=FEATURE_COLUMNS + ["future_ret"])
 
-    # For classification diagnostics (optional)
-    y_true = []
-    y_score = []
+    # Sort by time then symbol
+    df = df.sort_index()
 
-    # Iterate over each bar (per-symbol)
-    for (symbol, dt), row in panel.iterrows():
-        price = float(row["close"])
-        last_price[symbol] = price
+    # X as DataFrame with proper feature names -> avoids sklearn warning
+    X = df[FEATURE_COLUMNS]
 
-        # ---------- 1) Manage existing position in this symbol ----------
-        if symbol in positions:
-            pos = positions[symbol]
-            entry_price = pos["entry_price"]
-            bars_in_trade = pos["bars_in_trade"]
+    # Vectorized probability prediction
+    proba_up = clf.predict_proba(X)[:, 1]
+    df["proba_up"] = proba_up
 
-            pnl_pct = (price - entry_price) / entry_price
+    # Classification-style diagnostics on the full panel
+    y_true = df[LABEL_COLUMN].astype(int)
+    try:
+        val_auc = roc_auc_score(y_true, proba_up)
+    except ValueError:
+        val_auc = np.nan
+    y_pred = (proba_up >= P_UP_ENTRY_THRESHOLD).astype(int)
+    val_acc = accuracy_score(y_true, y_pred)
 
-            exit_reason = None
-            if pnl_pct <= -cfg.stop_loss_pct:
-                exit_reason = "stop"
-            elif pnl_pct >= cfg.take_profit_pct:
-                exit_reason = "take_profit"
-            elif bars_in_trade >= cfg.max_bars_in_trade:
-                exit_reason = "time"
+    # -----------------
+    # Build trades
+    # -----------------
+    trades = df[df["proba_up"] >= P_UP_ENTRY_THRESHOLD].copy()
+    if trades.empty:
+        print("No trades triggered by the ML model with current threshold.")
+        # build a flat equity curve
+        all_dts = (
+            panel_ohlcv.index.get_level_values("datetime")
+            .sort_values()
+            .unique()
+        )
+        equity = pd.Series(start_equity, index=all_dts, name="equity")
 
-            if exit_reason is not None:
-                # Close the position
-                shares = pos["shares"]
-                cash += shares * price
-                cash -= cfg.fee_per_order
-                del positions[symbol]
-            else:
-                pos["bars_in_trade"] = bars_in_trade + 1
+        bh_equity = build_buy_and_hold_equity(panel_ohlcv, start_equity)
 
-        # ---------- 2) Entry logic for this symbol ----------
-        flat_for_symbol = symbol not in positions
-        num_positions = len(positions)
+        metrics = {
+            "total_return": 0.0,
+            "CAGR": 0.0,
+            "sharpe": np.nan,
+            "max_drawdown": 0.0,
+            "final_equity": start_equity,
+            "start_equity": start_equity,
+            "n_trades": 0,
+            "win_rate": np.nan,
+            "avg_gain": np.nan,
+            "avg_loss": np.nan,
+            "val_auc_backtest": val_auc,
+            "val_accuracy_backtest": val_acc,
+        }
 
-        proba_up = np.nan
+        return BacktestResult(
+            equity=equity,
+            buy_hold_equity=bh_equity,
+            trades=trades,
+            metrics=metrics,
+        )
 
-        # Only try to open new position if we are flat in this symbol and under max positions
-        if flat_for_symbol and num_positions < cfg.max_concurrent_positions:
-            feat = row[list(cfg.feature_cols)]
+    # Turn MultiIndex into explicit columns
+    trades = trades.reset_index()
+    trades = trades.rename(columns={"datetime": "entry_dt"})
 
-            # Skip if any feature is NaN
-            if not feat.isna().any():
-                # Use a DataFrame so sklearn sees feature names (avoids warnings)
-                X_row = row[FEATURE_COLUMNS].to_frame().T   # 1-row DataFrame
-                proba_up = clf.predict_proba(X_row)[0, 1]
+    # Approximate exit_dt by horizon * bar size (minutes)
+    horiz_minutes = FUTURE_HORIZON_BARS * BAR_INTERVAL_MIN
+    trades["exit_dt"] = trades["entry_dt"] + pd.to_timedelta(horiz_minutes, unit="m")
 
+    # Realized return for the trade
+    trades["future_ret"] = trades["future_ret"].astype(float)
+    trades["trade_ret_raw"] = trades["future_ret"]
+    trades["trade_ret"] = trades["future_ret"].clip(
+        lower=-STOP_LOSS_PCT, upper=TAKE_PROFIT_PCT
+    )
 
-                if proba_up >= cfg.p_up_entry_threshold:
-                    # Position sizing
-                    risk_cap = cash * cfg.risk_per_trade_fraction
-                    shares = int(risk_cap / price)
-                    if shares >= 1:
-                        cash -= shares * price
-                        cash -= cfg.fee_per_order
-                        positions[symbol] = {
-                            "shares": shares,
-                            "entry_price": price,
-                            "bars_in_trade": 0,
-                        }
+    # Position size per trade (fixed fraction of start equity)
+    notional_per_trade = start_equity * RISK_PER_TRADE_FRACTION
+    trades["pnl_dollars"] = notional_per_trade * trades["trade_ret"]
 
-        # ---------- 3) Collect classification diagnostics ----------
-        if cfg.label_col in row and not np.isnan(row[cfg.label_col]) and not np.isnan(proba_up):
-            y_true.append(int(row[cfg.label_col]))
-            y_score.append(proba_up)
+    # Approximate exit price from entry_price and trade_ret
+    trades["entry_price"] = trades["close"]
+    trades["exit_price_est"] = trades["entry_price"] * (1.0 + trades["trade_ret"])
 
-        # ---------- 4) Compute current equity ----------
-        equity = cash
-        for sym, pos in positions.items():
-            px = last_price.get(sym, pos["entry_price"])
-            equity += pos["shares"] * px
+    # -----------------
+    # Build equity curve from trade PnL at exit times
+    # -----------------
+    pnl_by_exit = trades.groupby("exit_dt")["pnl_dollars"].sum().sort_index()
+    equity = pnl_by_exit.cumsum() + start_equity
+    equity.name = "strategy_equity"
 
-        equity_list.append(equity)
-        dt_list.append(dt)
+    # Reindex to full intraday timeline for smoother curve
+    all_dts = (
+        panel_ohlcv.index.get_level_values("datetime")
+        .sort_values()
+        .unique()
+    )
+    equity = equity.reindex(all_dts, method="ffill").fillna(start_equity)
 
-    # ---------- Liquidate remaining positions at last known price ----------
-    for sym, pos in positions.items():
-        px = last_price.get(sym, pos["entry_price"])
-        cash += pos["shares"] * px
-        cash -= cfg.fee_per_order
+    # Buy & hold benchmark
+    buy_hold_equity = build_buy_and_hold_equity(panel_ohlcv, start_equity)
 
-    if equity_list:
-        equity_list[-1] = cash  # final equity after liquidation
+    # -----------------
+    # Performance metrics
+    # -----------------
+    returns = equity.pct_change().fillna(0.0)
+    total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
 
-    equity_series = pd.Series(equity_list, index=pd.to_datetime(dt_list))
-    equity_df = pd.DataFrame({"equity": equity_series})
-
-    # ---------- Compute performance metrics ----------
-    metrics = compute_performance_metrics(equity_series, cfg.initial_capital)
-
-    # Optional classification metrics
-    if len(y_true) > 0 and len(set(y_true)) > 1:
-        try:
-            from sklearn.metrics import roc_auc_score, accuracy_score
-
-            metrics["val_auc_backtest"] = roc_auc_score(y_true, y_score)
-            y_pred = [1 if p >= cfg.p_up_entry_threshold else 0 for p in y_score]
-            metrics["val_accuracy_backtest"] = accuracy_score(y_true, y_pred)
-        except Exception:
-            pass
-
-    return equity_df, metrics
-
-
-def compute_performance_metrics(equity: pd.Series,
-                                initial_capital: float) -> Dict[str, float]:
-    # 1. Clean equity series
-    equity = equity.astype(float)
-
-    # Drop any NaNs at the start/end (e.g., preallocated values that were never filled)
-    equity = equity.dropna()
-
-    if equity.empty:
-        raise ValueError("Equity curve is empty after dropping NaNs; check backtest logic.")
-
-    start_equity = float(equity.iloc[0])
-    final_equity = float(equity.iloc[-1])
-
-    # 2. Returns (explicit fill_method to avoid FutureWarning)
-    returns = equity.pct_change(fill_method=None)
-    returns = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # 3. Compute metrics
-    total_return = final_equity / start_equity - 1.0
-
-    # If your index is datetime-like, you can annualize:
-    if hasattr(equity.index, "to_series"):
-        # Assume intraday bars but at least multiple days;
-        # use calendar days between first and last point
-        n_days = (equity.index[-1] - equity.index[0]).days
-        if n_days > 0:
-            years = n_days / 252.0  # or 365.0, depending on your convention
-            CAGR = (final_equity / start_equity) ** (1.0 / years) - 1.0
+    # Calendar CAGR approximation
+    if len(equity.index) > 1:
+        n_years = (equity.index[-1] - equity.index[0]).days / 365.25
+        if n_years > 0:
+            cagr = (1.0 + total_return) ** (1.0 / n_years) - 1.0
         else:
-            CAGR = np.nan
+            cagr = np.nan
     else:
-        CAGR = np.nan
-    minutes_per_year = 252 * 390
-    bars_per_year = minutes_per_year / BAR_INTERVAL_MIN
+        cagr = np.nan
+
     if returns.std() > 0:
-        sharpe = math.sqrt(bars_per_year) * returns.mean() / returns.std()
+        # Approximate Sharpe as if each step were one "day"
+        sharpe = np.sqrt(252.0) * returns.mean() / returns.std()
     else:
-        sharpe = float("nan")
+        sharpe = np.nan
 
     roll_max = equity.cummax()
     drawdown = (equity - roll_max) / roll_max
-    max_dd = float(drawdown.min())
+    max_dd = drawdown.min()
+
+    # Trade-level stats
+    n_trades = len(trades)
+    win_mask = trades["trade_ret"] > 0
+    lose_mask = trades["trade_ret"] < 0
+
+    win_rate = win_mask.mean() if n_trades > 0 else np.nan
+    avg_gain = trades.loc[win_mask, "trade_ret"].mean() if win_mask.any() else np.nan
+    avg_loss = trades.loc[lose_mask, "trade_ret"].mean() if lose_mask.any() else np.nan
 
     metrics = {
-        "total_return": total_return,
-        "CAGR": CAGR,
-        "sharpe": sharpe,
-        "max_drawdown": max_dd,
+        "total_return": float(total_return),
+        "CAGR": float(cagr) if pd.notna(cagr) else np.nan,
+        "sharpe": float(sharpe) if pd.notna(sharpe) else np.nan,
+        "max_drawdown": float(max_dd),
         "final_equity": float(equity.iloc[-1]),
         "start_equity": float(equity.iloc[0]),
+        "n_trades": int(n_trades),
+        "win_rate": float(win_rate) if pd.notna(win_rate) else np.nan,
+        "avg_gain": float(avg_gain) if pd.notna(avg_gain) else np.nan,
+        "avg_loss": float(avg_loss) if pd.notna(avg_loss) else np.nan,
+        "val_auc_backtest": float(val_auc) if pd.notna(val_auc) else np.nan,
+        "val_accuracy_backtest": float(val_acc) if pd.notna(val_acc) else np.nan,
     }
-    return metrics
+
+    return BacktestResult(
+        equity=equity,
+        buy_hold_equity=buy_hold_equity,
+        trades=trades,
+        metrics=metrics,
+    )
 
 
-# =========================
-# Script entry point
-# =========================
+# -------------------------------------------------------
+# Main script
+# -------------------------------------------------------
+
 
 def main():
-    print("=== Step 1: Load raw OHLCV data ===")
-    panel_ohlcv = load_panel_ohlcv(DATA_DIR, UNIVERSE)
-    print("Panel OHLCV shape:", panel_ohlcv.shape)
-    print("Panel OHLCV index example:", panel_ohlcv.index[:5])
+    project_root = Path(__file__).resolve().parent
 
+    # 1) Load OHLCV
+    panel_ohlcv = load_panel_ohlcv(DATA_DIR, UNIVERSE)
+
+    # 2) Build features + future returns
     print("\n=== Step 2: Build features & labels ===")
     panel_with_features = build_panel_features_and_labels(panel_ohlcv)
-    print("Panel with features+labels shape:", panel_with_features.shape)
-    print("Panel columns (first 20):", list(panel_with_features.columns)[:20])
+    print(f"Panel with features+labels shape: {panel_with_features.shape}")
+    print(
+        "Panel columns (first 20):",
+        list(panel_with_features.columns[:20]),
+    )
 
+    # 3) Load classifier
     print("\n=== Step 3: Load trained classifier ===")
-    clf = load_classifier(MODEL_DIR)
-    print("Loaded classifier:", type(clf))
+    clf = load_latest_classifier(MODEL_DIR)
 
-    print("\n=== Step 4: Run backtest ===")
-    bt_cfg = BacktestConfig()
-    equity_df, metrics = run_backtest(panel_with_features, clf, bt_cfg)
+    # 4) Run backtest
+    result = run_backtest(panel_with_features, panel_ohlcv, clf, start_equity=100_000.0)
 
+    equity = result.equity
+    buy_hold_equity = result.buy_hold_equity
+    trades = result.trades
+    metrics = result.metrics
+
+    # Print metrics
     print("\nBacktest metrics:")
     for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
-    # Optionally save equity curve
-    out_path = Path("equity_curve.csv")
-    equity_df.to_csv(out_path)
-    print(f"\nSaved equity curve to {out_path.resolve()}")
+    # Trade summary (first few)
+    if not trades.empty:
+        print("\nTrade summary (first 10 trades):")
+        cols = [
+            "symbol",
+            "entry_dt",
+            "exit_dt",
+            "entry_price",
+            "exit_price_est",
+            "proba_up",
+            "trade_ret",
+            "pnl_dollars",
+        ]
+        cols = [c for c in cols if c in trades.columns]
+        print(trades[cols].head(10).to_string(index=False))
+
+        # Save full trades to CSV
+        trades_path = project_root / "trades.csv"
+        trades.to_csv(trades_path, index=False)
+        print(f"\nSaved full trade log to {trades_path}")
+
+    # Save equity curves to CSV
+    equity_df = pd.DataFrame(
+        {
+            "strategy_equity": equity,
+            "buy_hold_equity": buy_hold_equity.reindex(equity.index, method="ffill"),
+        }
+    )
+    eq_path = project_root / "equity_curve.csv"
+    equity_df.to_csv(eq_path)
+    print(f"Saved equity curves to {eq_path}")
+
+    # Plot equity vs buy & hold
+    plt.figure(figsize=(11, 5))
+    plt.plot(equity.index, equity.values, label="ML strategy")
+    # Align buy & hold to same index
+    bh_aligned = buy_hold_equity.reindex(equity.index, method="ffill")
+    plt.plot(
+        bh_aligned.index,
+        bh_aligned.values,
+        label="Buy & hold (equal-weight)",
+        linestyle="--",
+    )
+    plt.xlabel("Time")
+    plt.ylabel("Equity ($)")
+    plt.title("ML Strategy vs Buy & Hold")
+    plt.legend()
+    plt.tight_layout()
+
+    plot_path = project_root / "equity_vs_buyhold.png"
+    plt.savefig(plot_path, dpi=150)
+    print(f"Saved equity comparison plot to {plot_path}")
+
+    plt.show()
 
 
 if __name__ == "__main__":
