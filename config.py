@@ -1,0 +1,72 @@
+# config.py
+
+from pathlib import Path
+
+# =====================
+# Universe & bar config
+# =====================
+
+UNIVERSE = [
+    "VEEE",
+    "CMCT",
+    "CRCG",
+    "CRCA",
+    "CCUP",
+    "TMC",
+    "ONMD",
+    "BEX",
+    "PAPL",
+    "BNC",
+]
+
+BAR_INTERVAL_MIN = 5             # 5-minute bars
+FUTURE_HORIZON_BARS = 6          # 30 minutes ahead (6 * 5min)
+LABEL_UP_THRESHOLD = 0.0075      # +0.75% threshold for "up" label
+
+# =====================
+# Trading / risk config
+# =====================
+
+P_UP_ENTRY_THRESHOLD = 0.70      # ML probability threshold to enter long
+MAX_CONCURRENT_POSITIONS = 4
+RISK_PER_TRADE_FRACTION = 0.025  # 2.5% of equity per trade
+STOP_LOSS_PCT = 0.02             # 2% down
+TAKE_PROFIT_PCT = 0.05           # 5% up
+MAX_BARS_IN_TRADE = 8            # 8 * 5min = 40min hold max
+DAILY_LOSS_STOP_FRACTION = 0.05  # stop trading if down 5% on the day
+
+# Flat per-order fee (e.g. 1.50 per transaction)
+FEE_PER_ORDER = 1.50
+
+# =====================
+# Paths
+# =====================
+
+PROJECT_ROOT = Path(__file__).resolve().parent  # folder with config.py
+DATA_DIR = PROJECT_ROOT / "quant" / "data"
+MODEL_DIR = PROJECT_ROOT / "models"
+
+# =====================
+# ML feature config
+# =====================
+
+LABEL_COLUMN = "label_up"
+
+# Features produced in quant_model.build_features_for_symbol(...)
+# plus symbol_id (added inside ml_model.add_symbol_id_feature)
+FEATURE_COLUMNS = [
+    "ret_1",
+    "ret_3",
+    "ret_6",
+    "vol_60",
+    "vwap",
+    "dev_vwap",
+    "dev_vwap_z",
+    "vol_z",
+    "time_minutes",
+    "time_of_day_norm",
+]
+
+# Time-based split between train / validation for ML
+TEST_SPLIT_DATE = "2024-07-01"
+TRAIN_VAL_SPLIT_DATE = "2025-10-10"
