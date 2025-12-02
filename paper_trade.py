@@ -1,41 +1,3 @@
-# paper_trade.py
-"""
-Live paper-trading loop for the intraday ML model using IBKR.
-
-Folder layout assumed (your screenshot):
----------------------------------------
-INTRADAY_TRADING/
-    ML/
-        __init__.py
-        ml_model.py
-    quant/
-        __init__.py
-        quant_model.py
-        data/...
-    models/
-        intraday_gbm.joblib
-    backtesting.py
-    config.py
-    download_data.py
-    train_ml.py
-    paper_trade.py   <-- this file
-
-What this script does:
-----------------------
-1. Connects to IBKR paper TWS / Gateway via ib_insync.
-2. Subscribes to streaming 5-min bars (BAR_INTERVAL_MIN from config) for UNIVERSE.
-3. Maintains an OHLCV buffer per symbol in memory.
-4. On each new completed bar for a symbol:
-   - Append the bar to that symbol's buffer.
-   - Recompute features with quant.quant_model.build_features_for_symbol.
-   - Compute p_up with the trained GBM classifier.
-   - If p_up >= P_UP_ENTRY_THRESHOLD and risk checks pass, send BUY order.
-5. For open positions:
-   - Checks stop-loss / take-profit on each new bar.
-   - If hit, sends SELL order and updates realized PnL.
-6. Tracks simple intraday realized PnL and applies DAILY_LOSS_STOP_FRACTION.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -45,7 +7,7 @@ import datetime as dt
 from pathlib import Path
 
 import pandas as pd
-from ib_insync import IB, Stock, MarketOrder  # pip install ib_insync
+from ib_insync import IB, Stock, MarketOrder
 
 from config import (
     UNIVERSE,
@@ -60,33 +22,17 @@ from config import (
     DAILY_LOSS_STOP_FRACTION,
 )
 
-# NOTE: quant_model is inside the 'quant' package folder
 from quant.quant_model import build_features_for_symbol
-
 from backtesting import load_latest_classifier
 
 
-# ----------------------------------------------
-# High-level trading parameters for this script
-# ----------------------------------------------
-
-# Used only for internal risk sizing / daily PnL tracking.
-# IB itself will still track real paper PnL.
 STARTING_EQUITY = 100_000.0
-
-# Max number of bars we keep per symbol in memory
 MAX_BUFFER_LENGTH = 500
 
 
-# ----------------------------------------------
-# Position state
-# ----------------------------------------------
-
 @dataclass
 class Position:
-    """
-    Represents one open long position in a symbol.
-    """
+    """Single open long position with entry, size, and risk levels."""
     symbol: str
     size: int
     entry_price: float
@@ -95,85 +41,47 @@ class Position:
     take_profit_price: float
 
 
-# ----------------------------------------------
-# Main trader class
-# ----------------------------------------------
-
 class PaperTrader:
+    """Event-driven paper trader that streams IBKR bars and applies the ML signal."""
+
     def __init__(self) -> None:
-        # IBKR connection and classifier
+        """Initialize empty IB connection, model handle, and trading state."""
         self.ib: Optional[IB] = None
         self.clf = None
-
-        # symbol -> IB contract
         self.contracts: Dict[str, Stock] = {}
-
-        # symbol -> OHLCV DataFrame (DatetimeIndex, cols [open, high, low, close, volume])
         self.ohlcv_buffers: Dict[str, pd.DataFrame] = {}
-
-        # symbol -> Position
         self.positions: Dict[str, Position] = {}
-
-        # PnL and risk
         self.start_of_day_equity: float = STARTING_EQUITY
         self.realized_pnl_today: float = 0.0
-
-        # symbol -> BarDataList subscription
         self.bar_subscriptions = {}
 
-    # =========================
-    # Setup / initialization
-    # =========================
-
     def connect_and_load(self) -> None:
-        """
-        1. Connect to IBKR.
-        2. Load the trained classifier.
-        3. Build and qualify contracts.
-        4. Initialize OHLCV buffers.
-        """
-        # --- 1. IBKR connection (paper account) ---
+        """Connect to IBKR, load model, qualify contracts, and initialize buffers."""
         self.ib = IB()
-        # Assumes TWS/Gateway is running in PAPER mode on port 7497
-        # Change port if your setup is different.
         self.ib.connect("127.0.0.1", 7497, clientId=1)
 
-        # --- 2. Load classifier from MODEL_DIR/intraday_gbm.joblib ---
         self.clf = load_latest_classifier(MODEL_DIR)
 
-        # --- 3. Build Stock contracts for each symbol in UNIVERSE ---
         for sym in UNIVERSE:
-            # If these are TSX symbols, change currency/exchange accordingly
             self.contracts[sym] = Stock(sym, "SMART", "USD")
 
-        # Qualify contracts so IBKR fills in ids, exchanges, etc.
         self.ib.qualifyContracts(*self.contracts.values())
 
-        # --- 4. Empty OHLCV buffers ---
         for sym in UNIVERSE:
             self.ohlcv_buffers[sym] = self._empty_buffer()
 
     @staticmethod
     def _empty_buffer() -> pd.DataFrame:
+        """Create an empty OHLCV buffer for a symbol."""
         cols = ["open", "high", "low", "close", "volume"]
         return pd.DataFrame(columns=cols)
 
-    # =========================
-    # Risk helpers
-    # =========================
-
     def _current_equity(self) -> float:
-        """
-        Approximate intraday equity used for sizing:
-        starting_equity + realized_pnl_today.
-        (Does not include unrealized PnL.)
-        """
+        """Approximate intraday equity as starting capital plus realized PnL."""
         return self.start_of_day_equity + self.realized_pnl_today
 
     def _daily_loss_exceeded(self) -> bool:
-        """
-        Returns True if we hit DAILY_LOSS_STOP_FRACTION.
-        """
+        """Check whether intraday drawdown breached the configured loss limit."""
         eq = self._current_equity()
         if eq <= 0:
             return True
@@ -182,12 +90,7 @@ class PaperTrader:
         return drawdown_fraction >= DAILY_LOSS_STOP_FRACTION
 
     def _can_open_position(self, symbol: str) -> bool:
-        """
-        Check:
-          - not already long that symbol
-          - max concurrent positions not exceeded
-          - daily loss stop not exceeded
-        """
+        """Enforce position, concurrency, and daily loss constraints before entry."""
         if symbol in self.positions:
             return False
         if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
@@ -197,10 +100,7 @@ class PaperTrader:
         return True
 
     def _calc_position_size(self, last_price: float) -> int:
-        """
-        Fixed-fraction sizing:
-        notional_per_trade = RISK_PER_TRADE_FRACTION * equity
-        """
+        """Compute trade size as a fixed fraction of equity divided by price."""
         eq = self._current_equity()
         notional = RISK_PER_TRADE_FRACTION * eq
         if last_price <= 0:
@@ -208,72 +108,36 @@ class PaperTrader:
         size = int(notional / last_price)
         return max(size, 0)
 
-    # =========================
-    # ML signal computation
-    # =========================
-
     def _compute_p_up(self, symbol: str) -> Optional[float]:
-        """
-        Turn the OHLCV buffer for one symbol into features,
-        then ask the GBM model for p_up.
-        """
+        """Generate p_up from the model for the latest bar of a symbol."""
         buf = self.ohlcv_buffers[symbol]
 
-        # Need enough history for rolling windows (VWAP, 60-bar vol, z-scores, etc.)
         if buf.empty or len(buf) < 50:
             return None
 
-        # build_features_for_symbol expects DatetimeIndex + OHLCV columns
         df = buf.copy()
         df.index = pd.to_datetime(df.index)
 
         feat_df = build_features_for_symbol(df)
-
-        # Take the most recent row as "current bar features"
         latest = feat_df.iloc[-1]
 
-        # Ensure all required feature columns exist and are non-NaN
         if latest[FEATURE_COLUMNS].isna().any():
             return None
 
-        X = latest[FEATURE_COLUMNS].to_frame().T  # shape (1, n_features)
+        X = latest[FEATURE_COLUMNS].to_frame().T
         p_up = self.clf.predict_proba(X)[:, 1][0]
         return float(p_up)
 
-    # =========================
-    # Order helpers
-    # =========================
-
     def _send_market_order(self, symbol: str, action: str, size: int, price_hint: float) -> float:
-        """
-        Send a MarketOrder to IBKR.
-
-        For internal PnL, we approximate fill at price_hint
-        (e.g., close of the bar). In real usage you can
-        extend this to wait for trade.fills and use the
-        actual fill prices.
-        """
+        """Send a market order to IBKR and return an approximate fill price."""
         contract = self.contracts[symbol]
         order = MarketOrder(action, size)
         trade = self.ib.placeOrder(contract, order)
 
-        # If you want real fill prices, you can:
-        # while not trade.isDone():
-        #     self.ib.waitOnUpdate()
-        # if trade.fills:
-        #     price_hint = trade.fills[-1].price
-
         return float(price_hint)
 
-    # =========================
-    # Entry / exit logic
-    # =========================
-
     def _handle_exit(self, symbol: str, last_price: float) -> None:
-        """
-        If we have an open position and the last_price
-        hits stop-loss or take-profit, close the position.
-        """
+        """Close positions that have hit stop-loss or take-profit thresholds."""
         pos = self.positions.get(symbol)
         if pos is None:
             return
@@ -292,9 +156,7 @@ class PaperTrader:
         del self.positions[symbol]
 
     def _handle_entry(self, symbol: str, last_price: float, bar_time: pd.Timestamp) -> None:
-        """
-        Check ML signal and risk constraints; if passed, open a long.
-        """
+        """Evaluate signal and, if permitted by risk, open a new long position."""
         if not self._can_open_position(symbol):
             return
 
@@ -327,22 +189,12 @@ class PaperTrader:
             f"p_up={p_up:.3f}, stop={stop_price:.2f}, tp={take_profit_price:.2f}"
         )
 
-    # =========================
-    # Bar handling
-    # =========================
-
     def _on_bar(self, symbol: str, bar) -> None:
-        """
-        Core per-bar handler:
-          - Append new bar to buffer.
-          - First evaluate exits, then potential entry.
-        """
-        # bar.date is typically a datetime or a string like '20251128 10:35:00'
+        """Update symbol buffer with a new bar and run exit/entry logic."""
         ts = pd.to_datetime(getattr(bar, "date", dt.datetime.utcnow()))
         last_price = float(bar.close)
         volume = float(getattr(bar, "volume", 0.0))
 
-        # Append to buffer
         buf = self.ohlcv_buffers[symbol]
         new_row = pd.DataFrame(
             {
@@ -361,18 +213,11 @@ class PaperTrader:
 
         self.ohlcv_buffers[symbol] = buf
 
-        # 1) Exit logic first (respect stops / targets)
         self._handle_exit(symbol, last_price)
-
-        # 2) Then entry logic (if flat)
         self._handle_entry(symbol, last_price, ts)
 
     def _make_bar_handler(self, symbol: str):
-        """
-        Closure that adapts ib_insync's bars.updateEvent callback
-        to call _on_bar(symbol, latest_bar).
-        """
-
+        """Create an ib_insync updateEvent handler bound to a given symbol."""
         def handler(bars, hasNewBar: bool) -> None:
             if not hasNewBar:
                 return
@@ -381,43 +226,32 @@ class PaperTrader:
 
         return handler
 
-    # =========================
-    # Subscription & main loop
-    # =========================
-
     def subscribe_bars(self) -> None:
-        """
-        Subscribe to streaming 5-min bars for each symbol in UNIVERSE.
-        """
+        """Subscribe to streaming intraday bars for the configured universe."""
         for sym, contract in self.contracts.items():
             bars = self.ib.reqHistoricalData(
                 contract,
                 endDateTime="",
-                durationStr="2 D",  # enough history to seed features
+                durationStr="2 D",
                 barSizeSetting=f"{BAR_INTERVAL_MIN} mins",
                 whatToShow="TRADES",
                 useRTH=True,
                 formatDate=1,
-                keepUpToDate=True,  # <-- streaming updates
+                keepUpToDate=True,
             )
             bars.updateEvent += self._make_bar_handler(sym)
             self.bar_subscriptions[sym] = bars
 
     def run(self) -> None:
-        """
-        Entry point: connect, subscribe, and start ib_insync event loop.
-        """
+        """Start the paper-trading event loop with live IBKR data."""
         self.connect_and_load()
         self.subscribe_bars()
         print("Starting IBKR paper trading loop...")
         self.ib.run()
 
 
-# ----------------------------------------------
-# Script entry point
-# ----------------------------------------------
-
 def main() -> None:
+    """Instantiate a PaperTrader and execute the live paper-trading loop."""
     trader = PaperTrader()
     trader.run()
 

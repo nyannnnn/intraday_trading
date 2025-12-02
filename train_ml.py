@@ -1,13 +1,3 @@
-# train_ml.py
-"""
-Offline training script for the intraday ML model.
-
-1. Load per-symbol OHLCV CSVs into a single panel DataFrame.
-2. Build features & labels using quant_model.build_panel_features_and_labels.
-3. Train GradientBoosting model with a time-based train/validation split.
-4. Save trained model to disk.
-"""
-
 from pathlib import Path
 
 import pandas as pd
@@ -24,17 +14,8 @@ from quant.quant_model import build_panel_features_and_labels
 from ML.ml_model import MLModelConfig, MLSignalModel
 
 
-# ---------- Helpers to load raw data ----------
-
 def load_panel_ohlcv(data_dir: Path, universe: list[str]) -> pd.DataFrame:
-    """
-    Load all per-symbol CSVs from data_dir into a single panel DataFrame.
-
-    Expects files like:
-        data_dir / f"{symbol}.csv"
-
-    And each CSV should have columns: datetime, open, high, low, close, volume
-    """
+    """Load per-symbol OHLCV CSVs into a (symbol, datetime) panel DataFrame."""
     frames = []
     for sym in universe:
         csv_path = data_dir / f"{sym}.csv"
@@ -43,10 +24,8 @@ def load_panel_ohlcv(data_dir: Path, universe: list[str]) -> pd.DataFrame:
             continue
 
         df = pd.read_csv(csv_path)
-        # Standardise column names
         df.columns = [c.lower() for c in df.columns]
 
-        # We expect at least datetime, open, high, low, close, volume
         if "datetime" not in df.columns:
             raise ValueError(f"{csv_path} has no 'datetime' column")
 
@@ -70,9 +49,8 @@ def load_panel_ohlcv(data_dir: Path, universe: list[str]) -> pd.DataFrame:
     return all_df
 
 
-# ---------- Main training routine ----------
-
 def main():
+    """Train the intraday ML model with time-based split and persist it to disk."""
     print("=== Step 1: Load raw OHLCV data ===")
     panel_ohlcv = load_panel_ohlcv(DATA_DIR, UNIVERSE)
     print("Panel OHLCV shape:", panel_ohlcv.shape)
