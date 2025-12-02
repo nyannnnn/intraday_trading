@@ -29,6 +29,9 @@ from backtesting import load_latest_classifier
 STARTING_EQUITY = 100_000.0
 MAX_BUFFER_LENGTH = 500
 
+# How long to wait for an order to leave "Pending/Submitted" state (seconds)
+ORDER_WAIT_TIMEOUT_SEC = 15
+
 
 @dataclass
 class Position:
@@ -92,6 +95,47 @@ class PaperTrader:
         """Create an empty OHLCV buffer for a symbol."""
         cols = ["open", "high", "low", "close", "volume"]
         return pd.DataFrame(columns=cols)
+
+    # ------------ sync existing IB positions on startup ------------
+
+    def _load_existing_ib_positions(self) -> None:
+        """
+        Load existing IBKR positions into self.positions so restarts keep track.
+        Only handles long stock positions in our UNIVERSE.
+        """
+        self._log("Loading existing IBKR positions into local state...")
+        ib_positions = self.ib.positions()  # list of ib_insync.Position
+
+        for p in ib_positions:
+            sym = p.contract.symbol
+
+            # Only track symbols in our universe
+            if sym not in UNIVERSE:
+                continue
+
+            size = int(p.position)
+            if size <= 0:
+                # Ignore flat/short for now
+                continue
+
+            entry_price = float(p.avgCost)
+            stop_price = entry_price * (1.0 - STOP_LOSS_PCT)
+            take_profit_price = entry_price * (1.0 + TAKE_PROFIT_PCT)
+
+            self.positions[sym] = Position(
+                symbol=sym,
+                size=size,
+                entry_price=entry_price,
+                entry_dt=pd.Timestamp.utcnow(),  # unknown true open time
+                stop_price=stop_price,
+                take_profit_price=take_profit_price,
+            )
+
+            self._log(
+                f"[SYNC] Loaded existing position from IB: {sym}, "
+                f"size={size}, entry_price={entry_price:.4f}, "
+                f"stop={stop_price:.4f}, tp={take_profit_price:.4f}"
+            )
 
     # ------------ risk / equity helpers ------------
 
@@ -176,25 +220,80 @@ class PaperTrader:
         self._log(f"Computed p_up for {symbol}: {p_up:.4f}")
         return p_up
 
-    # ------------ order handling ------------
+    # ------------ order handling with fill tracking ------------
+
+    def _wait_for_trade_fill(self, trade) -> Optional[float]:
+        """
+        Wait for a trade to be filled or cancelled, up to ORDER_WAIT_TIMEOUT_SEC.
+        Returns the avg fill price if filled, otherwise None.
+        """
+        deadline = dt.datetime.now() + dt.timedelta(seconds=ORDER_WAIT_TIMEOUT_SEC)
+
+        while True:
+            status = trade.orderStatus.status
+            filled = trade.orderStatus.filled
+            remaining = trade.orderStatus.remaining
+
+            # Log once in a while if still pending
+            self._log(
+                f"[ORDER] status={status}, filled={filled}, remaining={remaining}"
+            )
+
+            if status in ("Filled", "ApiCancelled", "Cancelled", "Inactive"):
+                break
+
+            if dt.datetime.now() >= deadline:
+                self._log(
+                    f"[ORDER] Timeout waiting for fill; last status={status}, "
+                    f"filled={filled}, remaining={remaining}"
+                )
+                break
+
+            # Let IB process events
+            self.ib.sleep(1)
+
+        status = trade.orderStatus.status
+        if status == "Filled" and trade.orderStatus.filled > 0:
+            fill_price = trade.orderStatus.avgFillPrice or trade.orderStatus.lastFillPrice
+            self._log(
+                f"[ORDER] Filled: orderId={trade.order.orderId}, "
+                f"avgFillPrice={fill_price:.4f}"
+            )
+            return float(fill_price)
+
+        self._log(
+            f"[ORDER] Not filled (final status={status}); treating as no trade."
+        )
+        return None
 
     def _send_market_order(
         self, symbol: str, action: str, size: int, price_hint: float
-    ) -> float:
-        """Send a market order to IBKR and return an approximate fill price."""
+    ) -> Optional[float]:
+        """
+        Send a market order to IBKR and return the actual fill price if filled.
+        If the order is cancelled/rejected or times out, returns None.
+        """
         self._log(
             f"Placing market order: symbol={symbol}, action={action}, size={size}, "
             f"price_hint={price_hint:.4f}"
         )
         contract = self.contracts[symbol]
         order = MarketOrder(action, size)
-        trade = self.ib.placeOrder(contract, order)
+        # Make TIF explicit to align with presets and reduce warnings
+        order.tif = "DAY"
 
-        # In a full implementation you might wait for actual fills; here we just log.
-        self._log(
-            f"Order submitted (not waiting for real fill). Using price_hint={price_hint:.4f}"
-        )
-        return float(price_hint)
+        trade = self.ib.placeOrder(contract, order)
+        fill_price = self._wait_for_trade_fill(trade)
+
+        if fill_price is None:
+            # No fill — do not treat this as a valid position change
+            self._log(
+                f"[ORDER] {action} {symbol} size={size} was not filled; "
+                "skipping position update."
+            )
+            return None
+
+        return fill_price
 
     def _handle_exit(self, symbol: str, last_price: float) -> None:
         """Close positions that have hit stop-loss or take-profit thresholds."""
@@ -215,6 +314,13 @@ class PaperTrader:
         )
 
         exit_price = self._send_market_order(symbol, "SELL", pos.size, last_price)
+        if exit_price is None:
+            # Exit did not execute; keep position open
+            self._log(
+                f"[EXIT] Order to close {symbol} was not filled; leaving position open."
+            )
+            return
+
         pnl = (exit_price - pos.entry_price) * pos.size
         self.realized_pnl_today += pnl
 
@@ -256,6 +362,12 @@ class PaperTrader:
         take_profit_price = last_price * (1.0 + TAKE_PROFIT_PCT)
 
         entry_price = self._send_market_order(symbol, "BUY", size, last_price)
+        if entry_price is None:
+            # Entry order did not fill -> do not open position locally
+            self._log(
+                f"[ENTRY] Order to open {symbol} was not filled; no position created."
+            )
+            return
 
         self.positions[symbol] = Position(
             symbol=symbol,
@@ -323,14 +435,13 @@ class PaperTrader:
                 whatToShow="TRADES",
                 useRTH=True,
                 formatDate=1,
-                keepUpToDate=False,  # <- no streaming, just a snapshot each poll
+                keepUpToDate=False,  # snapshot each poll
             )
 
             if not bars:
                 self._log(f"[POLL] No data returned for {sym}.")
                 continue
 
-            # Convert the returned bars into a DataFrame
             records = []
             for bar in bars:
                 ts = pd.to_datetime(getattr(bar, "date", dt.datetime.utcnow()))
@@ -386,6 +497,9 @@ class PaperTrader:
         """Start the paper-trading loop by polling bars every BAR_INTERVAL_MIN minutes."""
         self._log("Initializing paper trader...")
         self.connect_and_load()
+
+        # Sync any existing IB paper positions into our local state
+        self._load_existing_ib_positions()
 
         self._log(
             f"Starting polling bar loop (interval={BAR_INTERVAL_MIN} minutes)..."
