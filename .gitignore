@@ -1,0 +1,90 @@
+# --- OS / Editor junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
+.history/
+
+# --- Python bytecode / cache ---
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual environments ---
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Build / packaging (not used now, but safe) ---
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# --- Testing / coverage (future-proof) ---
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs / temp ---
+logs/
+*.log
+*.tmp
+tmp/
+temp/
+
+# --- Project-specific: models & data ---
+# Trained models
+models/
+*.joblib
+*.pkl
+*.sav
+
+# Raw / downloaded / intermediate data
+quant/data/
+data/
+data_raw/
+data_tmp/
+backtests/
+results/
+
+# If you want to keep placeholders, un-comment:
+# !quant/data/README.md
+# !models/README.md
+
+# --- Config / secrets ---
+.env
+.env.*
+*.env
+secrets.*
+credentials.*
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+
+# Optional: if you create a local-only config
+config_local.py
+config_dev.py
