@@ -20,6 +20,8 @@ from config import (
     TAKE_PROFIT_PCT,
     MAX_CONCURRENT_POSITIONS,
     DAILY_LOSS_STOP_FRACTION,
+    MAX_BARS_IN_TRADE,
+    COOLDOWN_BARS_AFTER_STOP,
 )
 
 from quant.quant_model import build_features_for_symbol
@@ -56,7 +58,8 @@ class PaperTrader:
         self.positions: Dict[str, Position] = {}
         self.start_of_day_equity: float = STARTING_EQUITY
         self.realized_pnl_today: float = 0.0
-
+        self.last_stop_bar: Dict[str, pd.Timestamp] = {}
+        
     # ------------ logging helper ------------
 
     @staticmethod
@@ -159,21 +162,37 @@ class PaperTrader:
             )
         return exceeded
 
-    def _can_open_position(self, symbol: str) -> bool:
-        """Enforce position, concurrency, and daily loss constraints before entry."""
+    def _can_open_position(self, symbol: str, bar_time: pd.Timestamp) -> bool:
+        """Enforce position, concurrency, daily loss, and cooldown constraints."""
         if symbol in self.positions:
             self._log(f"Skip entry for {symbol}: already in an open position.")
             return False
+
         if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
             self._log(
                 f"Skip entry for {symbol}: reached MAX_CONCURRENT_POSITIONS="
                 f"{MAX_CONCURRENT_POSITIONS}."
             )
             return False
+
         if self._daily_loss_exceeded():
             self._log(f"Skip entry for {symbol}: daily loss limit hit.")
             return False
+
+        # --- Cooldown after STOP for this symbol ---
+        last_stop = self.last_stop_bar.get(symbol)
+        if last_stop is not None:
+            bars_since_stop = (bar_time - last_stop) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
+            if bars_since_stop < COOLDOWN_BARS_AFTER_STOP:
+                self._log(
+                    f"Skip entry for {symbol}: in cooldown after STOP "
+                    f"({bars_since_stop:.1f} bars ago, cooldown="
+                    f"{COOLDOWN_BARS_AFTER_STOP} bars)."
+                )
+                return False
+
         return True
+
 
     def _calc_position_size(self, last_price: float) -> int:
         """Compute trade size as a fixed fraction of equity divided by price."""
@@ -295,22 +314,35 @@ class PaperTrader:
 
         return fill_price
 
-    def _handle_exit(self, symbol: str, last_price: float) -> None:
-        """Close positions that have hit stop-loss or take-profit thresholds."""
+    def _handle_exit(self, symbol: str, last_price: float, bar_time: pd.Timestamp) -> None:
+        """
+        Close positions that have hit stop-loss, take-profit, or max-hold time.
+        """
         pos = self.positions.get(symbol)
         if pos is None:
             return
 
+        # How many bars have we held this position?
+        bars_held = (bar_time - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
+
         hit_stop = last_price <= pos.stop_price
         hit_tp = last_price >= pos.take_profit_price
+        hit_max_bars = bars_held >= MAX_BARS_IN_TRADE
 
-        if not (hit_stop or hit_tp):
+        if not (hit_stop or hit_tp or hit_max_bars):
             return
 
-        reason = "STOP" if hit_stop else "TAKE_PROFIT"
+        if hit_stop:
+            reason = "STOP"
+        elif hit_tp:
+            reason = "TAKE_PROFIT"
+        else:
+            reason = "MAX_BARS"
+
         self._log(
             f"Exit condition met for {symbol}: last_price={last_price:.4f}, "
-            f"stop={pos.stop_price:.4f}, tp={pos.take_profit_price:.4f}, reason={reason}"
+            f"stop={pos.stop_price:.4f}, tp={pos.take_profit_price:.4f}, "
+            f"bars_held={bars_held:.1f}, reason={reason}"
         )
 
         exit_price = self._send_market_order(symbol, "SELL", pos.size, last_price)
@@ -328,7 +360,13 @@ class PaperTrader:
             f"[EXIT] {symbol}: price={exit_price:.2f}, pnl={pnl:.2f}, "
             f"realized_pnl_today={self.realized_pnl_today:.2f}"
         )
+
+        # Record STOP for cooldown logic (but not for TP or time exit)
+        if hit_stop:
+            self.last_stop_bar[symbol] = bar_time
+
         del self.positions[symbol]
+
 
     def _handle_entry(
         self, symbol: str, last_price: float, bar_time: pd.Timestamp
@@ -338,7 +376,7 @@ class PaperTrader:
             f"Evaluating entry for {symbol} at {bar_time}, last_price={last_price:.4f}"
         )
 
-        if not self._can_open_position(symbol):
+        if not self._can_open_position(symbol, bar_time):
             return
 
         p_up = self._compute_p_up(symbol)
@@ -415,7 +453,7 @@ class PaperTrader:
         self.ohlcv_buffers[symbol] = buf
 
         # First manage exits on existing positions, then consider new entries
-        self._handle_exit(symbol, last_price)
+        self._handle_exit(symbol, last_price, ts)
         self._handle_entry(symbol, last_price, ts)
 
     # ------------ polling instead of streaming ------------
