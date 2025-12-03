@@ -10,7 +10,7 @@ UNIVERSE = [
     "BYND",
     "CNCK",
     "QBTS",
-    "RR",
+    "GOOS",
     "QTTB",
     "FTEL",
     "FLYE",

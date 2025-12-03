@@ -65,7 +65,7 @@ def download_symbol_intraday(
 
 def main():
     """Download intraday data for the universe and persist raw CSVs to disk."""
-    raw_dir: Path = DATA_DIR / "raw"
+    raw_dir: Path = DATA_DIR
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Saving raw data to: {raw_dir.resolve()}")
