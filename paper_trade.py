@@ -403,9 +403,16 @@ class PaperTrader:
 
         return fill_price
 
-    def _handle_exit(self, symbol: str, last_price: float, high_price: float, bar_time: pd.Timestamp) -> None:
+    def _handle_exit(
+        self,
+        symbol: str,
+        last_price: float,
+        high_price: float,
+        bar_time: pd.Timestamp,
+    ) -> None:
         """
-        Close positions that have hit stop-loss, take-profit, or max-hold time.
+        Close positions that have hit stop-loss, take-profit, +R target, or max-hold time.
+        Uses close for stop, intrabar high for TP, and closes early at +2R.
         """
         pos = self.positions.get(symbol)
         if pos is None:
@@ -414,23 +421,32 @@ class PaperTrader:
         # How many bars have we held this position?
         bars_held = (bar_time - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
 
+        # Compute R-multiple based on close
+        risk_per_share = pos.entry_price - pos.stop_price
+        pnl_per_share = last_price - pos.entry_price
+        r_multiple = (
+            pnl_per_share / risk_per_share if risk_per_share > 0 else float("nan")
+        )
+
         hit_stop = last_price <= pos.stop_price
         hit_tp = high_price >= pos.take_profit_price   # intrabar touch
+        hit_r2 = r_multiple >= 2.0                     # early TP at +2R
         hit_max_bars = bars_held >= MAX_BARS_IN_TRADE
 
-        if not (hit_stop or hit_tp or hit_max_bars):
+        if not (hit_stop or hit_tp or hit_r2 or hit_max_bars):
             return
 
         if hit_stop:
             reason = "STOP"
-        elif hit_tp:
+        elif hit_tp or hit_r2:
             reason = "TAKE_PROFIT"
         else:
             reason = "MAX_BARS"
+
         self._log(
             f"Exit condition met for {symbol}: last_price={last_price:.4f}, "
             f"stop={pos.stop_price:.4f}, tp={pos.take_profit_price:.4f}, "
-            f"bars_held={bars_held:.1f}, reason={reason}"
+            f"R={r_multiple:.2f}, bars_held={bars_held:.1f}, reason={reason}"
         )
 
         exit_price = self._send_market_order(symbol, "SELL", pos.size, last_price)
@@ -775,3 +791,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
