@@ -7,7 +7,7 @@ from pathlib import Path
 # =====================
 
 UNIVERSE = [
-    "BYND",
+    "SOFI",
     "CNCK",
     "QBTS",
     "RR",
@@ -26,12 +26,12 @@ LABEL_UP_THRESHOLD = 0.006      # +0.6% threshold for "up" label
 # =====================
 
 P_UP_ENTRY_THRESHOLD = 0.60      # ML probability threshold to enter long
-MAX_CONCURRENT_POSITIONS = 3
-RISK_PER_TRADE_FRACTION = 0.025  # 2.5% of equity per trade
+MAX_CONCURRENT_POSITIONS = 3    # max open trades at once
+RISK_PER_TRADE_FRACTION = 0.015   # 1.5% of total capital risked per trade
 STOP_LOSS_PCT = 0.02             # 2% down
 TAKE_PROFIT_PCT = 0.05           # 5% up
 MAX_BARS_IN_TRADE = 2*FUTURE_HORIZON_BARS            
-DAILY_LOSS_STOP_FRACTION = 0.05  # stop trading if down 5% on the day
+DAILY_LOSS_STOP_FRACTION = 0.03 # 3% daily loss stop
 COOLDOWN_BARS_AFTER_STOP = 6
 
 # Flat per-order fee (e.g. 1.50 per transaction)
