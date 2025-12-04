@@ -246,6 +246,59 @@ class PaperTrader:
         )
         return max(size, 0)
 
+    # ------------ open positions logging ------------
+
+    def _log_open_positions(self) -> None:
+        """
+        Log a snapshot of all open positions with:
+        - size
+        - entry price
+        - latest price
+        - $ / % PnL
+        - stop-loss level
+        - target exit (take-profit, i.e. 'price to sell at')
+        - R multiple and entry time
+        """
+        if not self.positions:
+            self._log("POSITIONS: none open.")
+            return
+
+        self._log("POSITIONS SNAPSHOT:")
+        for sym, pos in self.positions.items():
+            buf = self.ohlcv_buffers.get(sym)
+            if buf is not None and not buf.empty:
+                current_price = float(buf["close"].iloc[-1])
+            else:
+                # Fallback if we somehow don't have recent bars
+                current_price = pos.entry_price
+
+            pnl_per_share = current_price - pos.entry_price
+            pnl_dollar = pnl_per_share * pos.size
+            pnl_pct = (current_price / pos.entry_price - 1.0) * 100.0
+
+            risk_per_share = pos.entry_price - pos.stop_price
+            r_multiple = (
+                pnl_per_share / risk_per_share if risk_per_share > 0 else float("nan")
+            )
+
+            self._log(
+                "  {sym}: size={size}, entry={entry:.4f}, "
+                "last={last:.4f}, pnl={pnl:.2f} ({pnl_pct:.2f}%), "
+                "stop={sl:.4f}, target_exit={tp:.4f}, R={r:.2f}, "
+                "held_since={entry_dt}".format(
+                    sym=pos.symbol,
+                    size=pos.size,
+                    entry=pos.entry_price,
+                    last=current_price,
+                    pnl=pnl_dollar,
+                    pnl_pct=pnl_pct,
+                    sl=pos.stop_price,
+                    tp=pos.take_profit_price,  # your “price to sell it at”
+                    r=r_multiple,
+                    entry_dt=pos.entry_dt,
+                )
+            )
+
     # ------------ model / signal ------------
 
     def _compute_p_up(self, symbol: str) -> Optional[float]:
@@ -703,6 +756,10 @@ class PaperTrader:
         )
         while True:
             self._poll_bars_once()
+
+            # After processing all symbols for this poll, log a snapshot of open positions
+            self._log_open_positions()
+
             self._log(
                 f"[POLL] Sleeping for {BAR_INTERVAL_MIN} minutes before next poll..."
             )
