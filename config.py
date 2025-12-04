@@ -10,22 +10,22 @@ UNIVERSE = [
     "BYND",
     "CNCK",
     "QBTS",
-    "GOOS",
+    "RR",
     "QTTB",
-    "FTEL",
-    "FLYE",
+    "FIG",
+    "SYM",
     "AHMA",
 ]
 
 BAR_INTERVAL_MIN = 5             # 5-minute bars
 FUTURE_HORIZON_BARS = 6          # 30 minutes ahead (6 * 5min)
-LABEL_UP_THRESHOLD = 0.0075      # +0.75% threshold for "up" label
+LABEL_UP_THRESHOLD = 0.006      # +0.6% threshold for "up" label
 
 # =====================
 # Trading / risk config
 # =====================
 
-P_UP_ENTRY_THRESHOLD = 0.70      # ML probability threshold to enter long
+P_UP_ENTRY_THRESHOLD = 0.60      # ML probability threshold to enter long
 MAX_CONCURRENT_POSITIONS = 3
 RISK_PER_TRADE_FRACTION = 0.025  # 2.5% of equity per trade
 STOP_LOSS_PCT = 0.02             # 2% down

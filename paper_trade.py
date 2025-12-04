@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""
+Paper trading strategy (IBKR, 5-min bars):
+
+- Data: polls 5-min TRADES bars for UNIVERSE via reqHistoricalData.
+- Entry: ML classifier; open long if p_up >= P_UP_ENTRY_THRESHOLD and risk checks pass.
+- Exit: stop-loss on close, intrabar take-profit on high, early TP at +2R, or MAX_BARS_IN_TRADE.
+- Risk: size = RISK_PER_TRADE_FRACTION * equity / price, per-symbol cooldown after STOP,
+  and DAILY_LOSS_STOP_FRACTION to halt new entries.
+"""
+
 from dataclasses import dataclass
 from typing import Dict, Optional
 from types import SimpleNamespace
@@ -9,36 +19,30 @@ import datetime as dt
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
 
-# logging for aws
 import logging
 import os
 from logging.handlers import RotatingFileHandler
 
-# --- Logging setup ---
+# basic rotating file + console logging
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-
 LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
 
 logger = logging.getLogger("paper_trade")
 logger.setLevel(logging.INFO)
 
-# Formatter with timestamp
 formatter = logging.Formatter(
     fmt="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# File handler (rotates at 5 MB, keep 3 backups)
 file_handler = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# Console handler (for tmux / stdout)
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
-# --- End logging setup ---
 
 
 from config import (
@@ -57,44 +61,40 @@ from config import (
 )
 
 from quant.quant_model import build_features_for_symbol
-from backtesting import load_latest_classifier
-
+from backtesting import load_latest_classifier  # same model as backtest
 
 STARTING_EQUITY = 100_000.0
 MAX_BUFFER_LENGTH = 500
-
-# How long to wait for an order to leave "Pending/Submitted" state (seconds)
-ORDER_WAIT_TIMEOUT_SEC = 15
+ORDER_WAIT_TIMEOUT_SEC = 15  # max time to wait for order fills
 
 
 @dataclass
 class Position:
-    """Single open long position with entry, size, and risk levels."""
+    """Single open long position with entry, size, risk levels, and model p_up."""
     symbol: str
     size: int
     entry_price: float
     entry_dt: pd.Timestamp
     stop_price: float
     take_profit_price: float
+    p_up: float  # model probability at entry
 
 
 class PaperTrader:
-    """Polling-based paper trader that pulls IBKR bars and applies the ML signal."""
+    """Polling-based paper trader that applies ML signals on 5-min bars."""
 
     def __init__(self) -> None:
-        """Initialize empty IB connection, model handle, and trading state."""
+        """Initialize IB connection, model handle, and trading state."""
         self.ib: Optional[IB] = None
         self.clf = None
         self.contracts: Dict[str, Stock] = {}
         self.ohlcv_buffers: Dict[str, pd.DataFrame] = {}
         self.positions: Dict[str, Position] = {}
 
-        # intraday equity + PnL tracking
         self.start_of_day_equity: float = STARTING_EQUITY
         self.realized_pnl_today: float = 0.0
         self.last_stop_bar: Dict[str, pd.Timestamp] = {}
 
-        # daily trade log & date tracking
         self.trades_today: list[dict] = []
         self.current_trading_date: Optional[dt.date] = None
 
@@ -102,12 +102,13 @@ class PaperTrader:
 
     @staticmethod
     def _log(msg: str) -> None:
+        """Write a line to both file and console logs."""
         logger.info(msg)
 
     # ------------ setup / connection ------------
 
     def connect_and_load(self) -> None:
-        """Connect to IBKR, load model, qualify contracts, and initialize buffers."""
+        """Connect to IBKR, load model, qualify contracts, and init buffers."""
         self._log("Connecting to IBKR TWS/Gateway...")
         self.ib = IB()
         self.ib.connect("127.0.0.1", 7497, clientId=1)
@@ -132,36 +133,31 @@ class PaperTrader:
 
     @staticmethod
     def _empty_buffer() -> pd.DataFrame:
-        """Create an empty OHLCV buffer for a symbol."""
+        """Return an empty OHLCV buffer for a symbol."""
         cols = ["open", "high", "low", "close", "volume"]
         return pd.DataFrame(columns=cols)
 
     # ------------ sync existing IB positions on startup ------------
 
     def _load_existing_ib_positions(self) -> None:
-        """
-        Load existing IBKR positions into self.positions so restarts keep track.
-        Only handles long stock positions in our UNIVERSE.
-        """
+        """Mirror any existing IBKR long positions into local state."""
         self._log("Loading existing IBKR positions into local state...")
-        ib_positions = self.ib.positions()  # list of ib_insync.Position
+        ib_positions = self.ib.positions()
 
         for p in ib_positions:
             sym = p.contract.symbol
-
-            # Only track symbols in our universe
             if sym not in UNIVERSE:
                 continue
 
             size = int(p.position)
             if size <= 0:
-                # Ignore flat/short for now
                 continue
 
             entry_price = float(p.avgCost)
             stop_price = entry_price * (1.0 - STOP_LOSS_PCT)
             take_profit_price = entry_price * (1.0 + TAKE_PROFIT_PCT)
 
+            # We don't know original p_up; store a sentinel (0.0) just so the field exists
             self.positions[sym] = Position(
                 symbol=sym,
                 size=size,
@@ -169,6 +165,7 @@ class PaperTrader:
                 entry_dt=pd.Timestamp.utcnow(),  # unknown true open time
                 stop_price=stop_price,
                 take_profit_price=take_profit_price,
+                p_up=0.0,
             )
 
             self._log(
@@ -180,11 +177,11 @@ class PaperTrader:
     # ------------ risk / equity helpers ------------
 
     def _current_equity(self) -> float:
-        """Approximate intraday equity as starting capital plus realized PnL."""
+        """Estimate equity as starting capital plus realized PnL."""
         return self.start_of_day_equity + self.realized_pnl_today
 
     def _daily_loss_exceeded(self) -> bool:
-        """Check whether intraday drawdown breached the configured loss limit."""
+        """Check if daily loss exceeds configured drawdown limit."""
         eq = self._current_equity()
         if eq <= 0:
             self._log("Equity is non-positive; daily loss exceeded.")
@@ -200,7 +197,7 @@ class PaperTrader:
         return exceeded
 
     def _can_open_position(self, symbol: str, bar_time: pd.Timestamp) -> bool:
-        """Enforce position, concurrency, daily loss, and cooldown constraints."""
+        """Gate entries by concurrency, daily loss, and post-STOP cooldown."""
         if symbol in self.positions:
             self._log(f"Skip entry for {symbol}: already in an open position.")
             return False
@@ -216,10 +213,12 @@ class PaperTrader:
             self._log(f"Skip entry for {symbol}: daily loss limit hit.")
             return False
 
-        # --- Cooldown after STOP for this symbol ---
+        # Symbol-specific cooldown after a stop-loss exit
         last_stop = self.last_stop_bar.get(symbol)
         if last_stop is not None:
-            bars_since_stop = (bar_time - last_stop) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
+            bars_since_stop = (bar_time - last_stop) / dt.timedelta(
+                minutes=BAR_INTERVAL_MIN
+            )
             if bars_since_stop < COOLDOWN_BARS_AFTER_STOP:
                 self._log(
                     f"Skip entry for {symbol}: in cooldown after STOP "
@@ -231,7 +230,7 @@ class PaperTrader:
         return True
 
     def _calc_position_size(self, last_price: float) -> int:
-        """Compute trade size as a fixed fraction of equity divided by price."""
+        """Size trade as a fixed fraction of equity divided by price."""
         eq = self._current_equity()
         notional = RISK_PER_TRADE_FRACTION * eq
         if last_price <= 0:
@@ -249,16 +248,7 @@ class PaperTrader:
     # ------------ open positions logging ------------
 
     def _log_open_positions(self) -> None:
-        """
-        Log a snapshot of all open positions with:
-        - size
-        - entry price
-        - latest price
-        - $ / % PnL
-        - stop-loss level
-        - target exit (take-profit, i.e. 'price to sell at')
-        - R multiple and entry time
-        """
+        """Log snapshot of all open positions and their current R multiples."""
         if not self.positions:
             self._log("POSITIONS: none open.")
             return
@@ -269,7 +259,6 @@ class PaperTrader:
             if buf is not None and not buf.empty:
                 current_price = float(buf["close"].iloc[-1])
             else:
-                # Fallback if we somehow don't have recent bars
                 current_price = pos.entry_price
 
             pnl_per_share = current_price - pos.entry_price
@@ -285,7 +274,7 @@ class PaperTrader:
                 "  {sym}: size={size}, entry={entry:.4f}, "
                 "last={last:.4f}, pnl={pnl:.2f} ({pnl_pct:.2f}%), "
                 "stop={sl:.4f}, target_exit={tp:.4f}, R={r:.2f}, "
-                "held_since={entry_dt}".format(
+                "held_since={entry_dt}, p_up={p_up:.3f}".format(
                     sym=pos.symbol,
                     size=pos.size,
                     entry=pos.entry_price,
@@ -293,16 +282,17 @@ class PaperTrader:
                     pnl=pnl_dollar,
                     pnl_pct=pnl_pct,
                     sl=pos.stop_price,
-                    tp=pos.take_profit_price,  # your “price to sell it at”
+                    tp=pos.take_profit_price,
                     r=r_multiple,
                     entry_dt=pos.entry_dt,
+                    p_up=pos.p_up,
                 )
             )
 
     # ------------ model / signal ------------
 
     def _compute_p_up(self, symbol: str) -> Optional[float]:
-        """Generate p_up from the model for the latest bar of a symbol."""
+        """Compute model p_up for latest bar of a symbol."""
         buf = self.ohlcv_buffers[symbol]
 
         if buf.empty or len(buf) < 50:
@@ -331,10 +321,7 @@ class PaperTrader:
     # ------------ order handling with fill tracking ------------
 
     def _wait_for_trade_fill(self, trade) -> Optional[float]:
-        """
-        Wait for a trade to be filled or cancelled, up to ORDER_WAIT_TIMEOUT_SEC.
-        Returns the avg fill price if filled, otherwise None.
-        """
+        """Block until order is filled/cancelled or timeout, and return fill price."""
         deadline = dt.datetime.now() + dt.timedelta(seconds=ORDER_WAIT_TIMEOUT_SEC)
 
         while True:
@@ -342,7 +329,6 @@ class PaperTrader:
             filled = trade.orderStatus.filled
             remaining = trade.orderStatus.remaining
 
-            # Log once in a while if still pending
             self._log(
                 f"[ORDER] status={status}, filled={filled}, remaining={remaining}"
             )
@@ -357,12 +343,13 @@ class PaperTrader:
                 )
                 break
 
-            # Let IB process events
             self.ib.sleep(1)
 
         status = trade.orderStatus.status
         if status == "Filled" and trade.orderStatus.filled > 0:
-            fill_price = trade.orderStatus.avgFillPrice or trade.orderStatus.lastFillPrice
+            fill_price = (
+                trade.orderStatus.avgFillPrice or trade.orderStatus.lastFillPrice
+            )
             self._log(
                 f"[ORDER] Filled: orderId={trade.order.orderId}, "
                 f"avgFillPrice={fill_price:.4f}"
@@ -377,24 +364,19 @@ class PaperTrader:
     def _send_market_order(
         self, symbol: str, action: str, size: int, price_hint: float
     ) -> Optional[float]:
-        """
-        Send a market order to IBKR and return the actual fill price if filled.
-        If the order is cancelled/rejected or times out, returns None.
-        """
+        """Submit market order and return actual fill price if filled."""
         self._log(
             f"Placing market order: symbol={symbol}, action={action}, size={size}, "
             f"price_hint={price_hint:.4f}"
         )
         contract = self.contracts[symbol]
         order = MarketOrder(action, size)
-        # Make TIF explicit to align with presets and reduce warnings
         order.tif = "DAY"
 
         trade = self.ib.placeOrder(contract, order)
         fill_price = self._wait_for_trade_fill(trade)
 
         if fill_price is None:
-            # No fill — do not treat this as a valid position change
             self._log(
                 f"[ORDER] {action} {symbol} size={size} was not filled; "
                 "skipping position update."
@@ -410,18 +392,15 @@ class PaperTrader:
         high_price: float,
         bar_time: pd.Timestamp,
     ) -> None:
-        """
-        Close positions that have hit stop-loss, take-profit, +R target, or max-hold time.
-        Uses close for stop, intrabar high for TP, and closes early at +2R.
-        """
+        """Exit on stop-loss, intrabar TP, +2R target, or max holding bars."""
         pos = self.positions.get(symbol)
         if pos is None:
             return
 
-        # How many bars have we held this position?
-        bars_held = (bar_time - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
+        bars_held = (bar_time - pos.entry_dt) / dt.timedelta(
+            minutes=BAR_INTERVAL_MIN
+        )
 
-        # Compute R-multiple based on close
         risk_per_share = pos.entry_price - pos.stop_price
         pnl_per_share = last_price - pos.entry_price
         r_multiple = (
@@ -429,8 +408,8 @@ class PaperTrader:
         )
 
         hit_stop = last_price <= pos.stop_price
-        hit_tp = high_price >= pos.take_profit_price   # intrabar touch
-        hit_r2 = r_multiple >= 2.0                     # early TP at +2R
+        hit_tp = high_price >= pos.take_profit_price       # intrabar touch
+        hit_r2 = r_multiple >= 2.0                         # early take profit at +2R
         hit_max_bars = bars_held >= MAX_BARS_IN_TRADE
 
         if not (hit_stop or hit_tp or hit_r2 or hit_max_bars):
@@ -451,7 +430,6 @@ class PaperTrader:
 
         exit_price = self._send_market_order(symbol, "SELL", pos.size, last_price)
         if exit_price is None:
-            # Exit did not execute; keep position open
             self._log(
                 f"[EXIT] Order to close {symbol} was not filled; leaving position open."
             )
@@ -460,7 +438,6 @@ class PaperTrader:
         pnl = (exit_price - pos.entry_price) * pos.size
         self.realized_pnl_today += pnl
 
-        # record trade details for daily log
         trade_record = {
             "symbol": symbol,
             "direction": "LONG",
@@ -472,6 +449,7 @@ class PaperTrader:
             "pnl": pnl,
             "reason": reason,
             "hold_bars": float(bars_held),
+            "p_up": pos.p_up,
         }
         self.trades_today.append(trade_record)
 
@@ -480,7 +458,7 @@ class PaperTrader:
             f"realized_pnl_today={self.realized_pnl_today:.2f}"
         )
 
-        # Record STOP for cooldown logic (but not for TP or time exit)
+        # Only STOP exits trigger cooldown
         if hit_stop:
             self.last_stop_bar[symbol] = bar_time
 
@@ -489,7 +467,7 @@ class PaperTrader:
     def _handle_entry(
         self, symbol: str, last_price: float, bar_time: pd.Timestamp
     ) -> None:
-        """Evaluate signal and, if permitted by risk, open a new long position."""
+        """Run ML signal for a symbol and open long if conditions are met."""
         self._log(
             f"Evaluating entry for {symbol} at {bar_time}, last_price={last_price:.4f}"
         )
@@ -519,7 +497,6 @@ class PaperTrader:
 
         entry_price = self._send_market_order(symbol, "BUY", size, last_price)
         if entry_price is None:
-            # Entry order did not fill -> do not open position locally
             self._log(
                 f"[ENTRY] Order to open {symbol} was not filled; no position created."
             )
@@ -532,6 +509,7 @@ class PaperTrader:
             entry_dt=bar_time,
             stop_price=stop_price,
             take_profit_price=take_profit_price,
+            p_up=p_up,
         )
 
         self._log(
@@ -542,7 +520,7 @@ class PaperTrader:
     # ------------ daily summary helpers ------------
 
     def _log_daily_summary(self, summary_date: dt.date) -> None:
-        """Log a detailed end-of-day summary with all trades and stats."""
+        """Log daily stats, trade list, and end-of-day open positions."""
         self._log("")
         self._log("=" * 70)
         self._log(f"DAILY SUMMARY for {summary_date.isoformat()}")
@@ -569,11 +547,8 @@ class PaperTrader:
             f"avg PnL/trade: {avg_pnl:.2f}, "
             f"win_rate: {win_rate:.1%}"
         )
-        self._log(
-            f"Max win: {max_win:.2f}, max loss: {max_loss:.2f}"
-        )
+        self._log(f"Max win: {max_win:.2f}, max loss: {max_loss:.2f}")
 
-        # Per-trade details
         if n_trades > 0:
             self._log("-" * 70)
             self._log("Per-trade details:")
@@ -583,12 +558,11 @@ class PaperTrader:
                     f"entry={t['entry_price']:.4f} @ {t['entry_dt']} | "
                     f"exit={t['exit_price']:.4f} @ {t['exit_dt']} | "
                     f"pnl={t['pnl']:.2f} | reason={t['reason']} | "
-                    f"hold_bars={t['hold_bars']:.1f}"
+                    f"hold_bars={t['hold_bars']:.1f} | p_up={t['p_up']:.3f}"
                 )
         else:
             self._log("No closed trades today.")
 
-        # Open positions snapshot
         if self.positions:
             self._log("-" * 70)
             self._log("Open positions at end of day:")
@@ -600,7 +574,8 @@ class PaperTrader:
                 unrealized = (last_price - pos.entry_price) * pos.size
                 self._log(
                     f"  {sym} | size={pos.size} | entry={pos.entry_price:.4f} | "
-                    f"last={last_price:.4f} | unrealized_pnl={unrealized:.2f}"
+                    f"last={last_price:.4f} | unrealized_pnl={unrealized:.2f} | "
+                    f"p_up={pos.p_up:.3f}"
                 )
         else:
             self._log("No open positions at end of day.")
@@ -608,14 +583,39 @@ class PaperTrader:
         self._log("=" * 70)
         self._log("")
 
+                # --- NEW: persist trades_today to CSV for analysis ---
+        if self.trades_today:
+            import csv
+
+            out_dir = "live_trades"
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"trades_{summary_date.isoformat()}.csv")
+
+            fieldnames = [
+                "symbol",
+                "direction",
+                "entry_dt",
+                "exit_dt",
+                "entry_price",
+                "exit_price",
+                "size",
+                "pnl",
+                "reason",
+                "hold_bars",
+                "p_up",
+            ]
+            with open(out_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for t in self.trades_today:
+                    writer.writerow(t)
+
+            self._log(f"Saved daily trades to {out_path}")
+
     def _maybe_roll_trading_day(self, bar_time: pd.Timestamp) -> None:
-        """
-        Detect when the calendar trading date changes and log/reset daily stats.
-        Called on every new bar before trading logic.
-        """
+        """Detect day changes, log summary, and reset daily counters."""
         trade_date = bar_time.date()
 
-        # first bar ever
         if self.current_trading_date is None:
             self.current_trading_date = trade_date
             self.start_of_day_equity = self._current_equity()
@@ -625,14 +625,11 @@ class PaperTrader:
             )
             return
 
-        # same day, nothing to do
         if trade_date == self.current_trading_date:
             return
 
-        # day changed -> log summary for old day, then reset counters for new day
         self._log_daily_summary(self.current_trading_date)
 
-        # roll forward equity baseline to include realized PnL from previous day
         self.start_of_day_equity = self._current_equity()
         self.realized_pnl_today = 0.0
         self.trades_today.clear()
@@ -647,10 +644,8 @@ class PaperTrader:
     # ------------ bar handling ------------
 
     def _on_bar(self, symbol: str, bar) -> None:
-        """Update symbol buffer with a new bar and run exit/entry logic."""
+        """Update buffer with new bar, then handle exits and entries."""
         ts = pd.to_datetime(getattr(bar, "date", dt.datetime.utcnow()))
-
-        # detect & handle new trading day
         self._maybe_roll_trading_day(ts)
 
         last_price = float(bar.close)
@@ -680,17 +675,13 @@ class PaperTrader:
 
         self.ohlcv_buffers[symbol] = buf
 
-        # First manage exits on existing positions, then consider new entries
         self._handle_exit(symbol, last_price, high_price, ts)
         self._handle_entry(symbol, last_price, ts)
 
     # ------------ polling instead of streaming ------------
 
     def _poll_bars_once(self) -> None:
-        """
-        Poll latest historical bars for each symbol and process only new bars.
-        This replaces streaming with keepUpToDate, which can be flaky.
-        """
+        """Snapshot latest 5-min bars from IBKR and process only new ones."""
         for sym, contract in self.contracts.items():
             self._log(f"[POLL] Requesting latest bars for {sym}...")
             bars = self.ib.reqHistoricalData(
@@ -701,7 +692,7 @@ class PaperTrader:
                 whatToShow="TRADES",
                 useRTH=True,
                 formatDate=1,
-                keepUpToDate=False,  # snapshot each poll
+                keepUpToDate=False,
             )
 
             if not bars:
@@ -728,7 +719,6 @@ class PaperTrader:
 
             buf = self.ohlcv_buffers[sym]
 
-            # First time: seed buffer but DO NOT trade on historical bars
             if buf.empty:
                 self._log(
                     f"[POLL] {sym}: seeding buffer with {len(df)} bars (no trading yet)."
@@ -745,7 +735,6 @@ class PaperTrader:
 
             self._log(f"[POLL] {sym}: processing {len(new_df)} new bars.")
 
-            # For each truly new bar, call the same logic as live streaming would
             for ts, row in new_df.iterrows():
                 bar_obj = SimpleNamespace(
                     date=ts,
@@ -760,11 +749,9 @@ class PaperTrader:
     # ------------ main loop ------------
 
     def run(self) -> None:
-        """Start the paper-trading loop by polling bars every BAR_INTERVAL_MIN minutes."""
+        """Main loop: poll bars, trade, then sleep for BAR_INTERVAL_MIN minutes."""
         self._log("Initializing paper trader...")
         self.connect_and_load()
-
-        # Sync any existing IB paper positions into our local state
         self._load_existing_ib_positions()
 
         self._log(
@@ -772,23 +759,19 @@ class PaperTrader:
         )
         while True:
             self._poll_bars_once()
-
-            # After processing all symbols for this poll, log a snapshot of open positions
             self._log_open_positions()
 
             self._log(
                 f"[POLL] Sleeping for {BAR_INTERVAL_MIN} minutes before next poll..."
             )
-            # Use ib.sleep so IB's internal event loop continues to process messages
             self.ib.sleep(BAR_INTERVAL_MIN * 60)
 
 
 def main() -> None:
-    """Instantiate a PaperTrader and execute the live paper-trading loop."""
+    """Instantiate a PaperTrader and run the live loop."""
     trader = PaperTrader()
     trader.run()
 
 
 if __name__ == "__main__":
     main()
-

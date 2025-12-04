@@ -274,6 +274,62 @@ def run_backtest(
     )
 
 
+def analyze_proba_buckets(panel_with_features: pd.DataFrame, clf) -> None:
+    """
+    Slice future returns by proba_up buckets to see where the real edge is.
+    Buckets: [0–0.5, 0.5–0.6, 0.6–0.7, 0.7–0.8, 0.8–0.9, 0.9–1.0].
+    """
+    df = panel_with_features.copy()
+
+    needed = FEATURE_COLUMNS + ["future_ret", LABEL_COLUMN]
+    for col in needed:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' missing in panel_with_features.")
+
+    df = df.dropna(subset=FEATURE_COLUMNS + ["future_ret"])
+    df = df.sort_index()
+
+    X = df[FEATURE_COLUMNS]
+    proba_up = clf.predict_proba(X)[:, 1]
+    df["proba_up"] = proba_up
+
+    # raw and clipped returns, same clipping as backtest
+    df["future_ret"] = df["future_ret"].astype(float)
+    df["trade_ret"] = df["future_ret"].clip(
+        lower=-STOP_LOSS_PCT, upper=TAKE_PROFIT_PCT
+    )
+
+    # define buckets
+    bins = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.001]
+    labels = [
+        "0.0–0.5",
+        "0.5–0.6",
+        "0.6–0.7",
+        "0.7–0.8",
+        "0.8–0.9",
+        "0.9–1.0",
+    ]
+    df["proba_bucket"] = pd.cut(df["proba_up"], bins=bins, labels=labels, right=False)
+
+    grouped = df.groupby("proba_bucket")
+
+    stats = grouped.agg(
+        n=("future_ret", "size"),
+        proba_mean=("proba_up", "mean"),
+        future_ret_mean=("future_ret", "mean"),
+        trade_ret_mean=("trade_ret", "mean"),
+        win_rate=("future_ret", lambda x: (x > 0).mean() if len(x) > 0 else np.nan),
+    ).reset_index()
+
+    print("\n=== Proba_up bucket analysis ===")
+    print(
+        "Each row shows how the next-horizon return behaves for different "
+        "ranges of model probability."
+    )
+    with pd.option_context("display.float_format", "{:0.5f}".format):
+        print(stats.to_string(index=False))
+
+
 def main():
     """Run offline backtest, print diagnostics, and persist curves/logs to disk."""
     project_root = Path(__file__).resolve().parent
@@ -290,6 +346,9 @@ def main():
 
     print("\n=== Step 3: Load trained classifier ===")
     clf = load_latest_classifier(MODEL_DIR)
+
+    # New: bucket analysis for proba_up -> future_ret
+    analyze_proba_buckets(panel_with_features, clf)
 
     result = run_backtest(panel_with_features, panel_ohlcv, clf, start_equity=100_000.0)
 
