@@ -403,7 +403,7 @@ class PaperTrader:
 
         return fill_price
 
-    def _handle_exit(self, symbol: str, last_price: float, bar_time: pd.Timestamp) -> None:
+    def _handle_exit(self, symbol: str, last_price: float, high_price: float, bar_time: pd.Timestamp) -> None:
         """
         Close positions that have hit stop-loss, take-profit, or max-hold time.
         """
@@ -415,7 +415,7 @@ class PaperTrader:
         bars_held = (bar_time - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
 
         hit_stop = last_price <= pos.stop_price
-        hit_tp = last_price >= pos.take_profit_price
+        hit_tp = high_price >= pos.take_profit_price   # intrabar touch
         hit_max_bars = bars_held >= MAX_BARS_IN_TRADE
 
         if not (hit_stop or hit_tp or hit_max_bars):
@@ -427,7 +427,6 @@ class PaperTrader:
             reason = "TAKE_PROFIT"
         else:
             reason = "MAX_BARS"
-
         self._log(
             f"Exit condition met for {symbol}: last_price={last_price:.4f}, "
             f"stop={pos.stop_price:.4f}, tp={pos.take_profit_price:.4f}, "
@@ -639,6 +638,7 @@ class PaperTrader:
         self._maybe_roll_trading_day(ts)
 
         last_price = float(bar.close)
+        high_price = float(bar.high)
         volume = float(getattr(bar, "volume", 0.0))
 
         self._log(
@@ -665,7 +665,7 @@ class PaperTrader:
         self.ohlcv_buffers[symbol] = buf
 
         # First manage exits on existing positions, then consider new entries
-        self._handle_exit(symbol, last_price, ts)
+        self._handle_exit(symbol, last_price, high_price, ts)
         self._handle_entry(symbol, last_price, ts)
 
     # ------------ polling instead of streaming ------------
