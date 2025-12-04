@@ -169,7 +169,7 @@ class PaperTrader:
 
     def _ib_net_liquidation(self) -> Optional[float]:
         """Fetch NetLiquidation from IBKR account values (returns None if unavailable)."""
-        self.ib.reqAccountUpdates(True, "")
+        self.ib.reqAccountUpdates(True)
         self.ib.sleep(1)
 
         net_liq = None
@@ -181,7 +181,7 @@ class PaperTrader:
                     net_liq = None
                 break
 
-        self.ib.reqAccountUpdates(False, "")
+        self.ib.reqAccountUpdates(False)
         return net_liq
 
     def _connect_ib_and_setup(self) -> None:
@@ -232,18 +232,6 @@ class PaperTrader:
     # ------------ loading existing positions ------------
 
     def _load_existing_ib_positions(self) -> None:
-        """Load existing IBKR positions into local Position objects.
-
-        For each open long position we find in the IB account that belongs to our UNIVERSE,
-        we synthesize a Position with:
-
-        - entry_price = avgCost from IB
-        - size       = position quantity
-        - stop       = entry_price * (1 - STOP_LOSS_PCT)
-        - tp         = entry_price * (1 + TAKE_PROFIT_PCT)
-
-        This means open trades adopt your latest risk parameters after a restart.
-        """
         self._log("Loading existing IBKR positions into local state...")
         ib_positions = self.ib.positions()
 
