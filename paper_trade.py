@@ -9,6 +9,38 @@ import datetime as dt
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder
 
+# logging for aws
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+
+# --- Logging setup ---
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
+
+logger = logging.getLogger("paper_trade")
+logger.setLevel(logging.INFO)
+
+# Formatter with timestamp
+formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# File handler (rotates at 5 MB, keep 3 backups)
+file_handler = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Console handler (for tmux / stdout)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+# --- End logging setup ---
+
+
 from config import (
     UNIVERSE,
     MODEL_DIR,
@@ -56,16 +88,21 @@ class PaperTrader:
         self.contracts: Dict[str, Stock] = {}
         self.ohlcv_buffers: Dict[str, pd.DataFrame] = {}
         self.positions: Dict[str, Position] = {}
+
+        # intraday equity + PnL tracking
         self.start_of_day_equity: float = STARTING_EQUITY
         self.realized_pnl_today: float = 0.0
         self.last_stop_bar: Dict[str, pd.Timestamp] = {}
-        
+
+        # daily trade log & date tracking
+        self.trades_today: list[dict] = []
+        self.current_trading_date: Optional[dt.date] = None
+
     # ------------ logging helper ------------
 
     @staticmethod
     def _log(msg: str) -> None:
-        ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}] {msg}")
+        logger.info(msg)
 
     # ------------ setup / connection ------------
 
@@ -192,7 +229,6 @@ class PaperTrader:
                 return False
 
         return True
-
 
     def _calc_position_size(self, last_price: float) -> int:
         """Compute trade size as a fixed fraction of equity divided by price."""
@@ -356,6 +392,21 @@ class PaperTrader:
         pnl = (exit_price - pos.entry_price) * pos.size
         self.realized_pnl_today += pnl
 
+        # record trade details for daily log
+        trade_record = {
+            "symbol": symbol,
+            "direction": "LONG",
+            "entry_dt": pos.entry_dt,
+            "exit_dt": bar_time,
+            "entry_price": pos.entry_price,
+            "exit_price": exit_price,
+            "size": pos.size,
+            "pnl": pnl,
+            "reason": reason,
+            "hold_bars": float(bars_held),
+        }
+        self.trades_today.append(trade_record)
+
         self._log(
             f"[EXIT] {symbol}: price={exit_price:.2f}, pnl={pnl:.2f}, "
             f"realized_pnl_today={self.realized_pnl_today:.2f}"
@@ -366,7 +417,6 @@ class PaperTrader:
             self.last_stop_bar[symbol] = bar_time
 
         del self.positions[symbol]
-
 
     def _handle_entry(
         self, symbol: str, last_price: float, bar_time: pd.Timestamp
@@ -421,11 +471,120 @@ class PaperTrader:
             f"p_up={p_up:.3f}, stop={stop_price:.2f}, tp={take_profit_price:.2f}"
         )
 
+    # ------------ daily summary helpers ------------
+
+    def _log_daily_summary(self, summary_date: dt.date) -> None:
+        """Log a detailed end-of-day summary with all trades and stats."""
+        self._log("")
+        self._log("=" * 70)
+        self._log(f"DAILY SUMMARY for {summary_date.isoformat()}")
+        self._log("=" * 70)
+
+        n_trades = len(self.trades_today)
+        total_realized = self.realized_pnl_today
+
+        wins = [t for t in self.trades_today if t["pnl"] > 0]
+        losses = [t for t in self.trades_today if t["pnl"] < 0]
+        flats = [t for t in self.trades_today if t["pnl"] == 0]
+
+        max_win = max((t["pnl"] for t in wins), default=0.0)
+        max_loss = min((t["pnl"] for t in losses), default=0.0)
+
+        avg_pnl = total_realized / n_trades if n_trades > 0 else 0.0
+        win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
+
+        self._log(
+            f"Trades: {n_trades}, wins={len(wins)}, losses={len(losses)}, flats={len(flats)}"
+        )
+        self._log(
+            f"Total realized PnL: {total_realized:.2f}, "
+            f"avg PnL/trade: {avg_pnl:.2f}, "
+            f"win_rate: {win_rate:.1%}"
+        )
+        self._log(
+            f"Max win: {max_win:.2f}, max loss: {max_loss:.2f}"
+        )
+
+        # Per-trade details
+        if n_trades > 0:
+            self._log("-" * 70)
+            self._log("Per-trade details:")
+            for t in self.trades_today:
+                self._log(
+                    f"  {t['symbol']} | dir={t['direction']} | size={t['size']} | "
+                    f"entry={t['entry_price']:.4f} @ {t['entry_dt']} | "
+                    f"exit={t['exit_price']:.4f} @ {t['exit_dt']} | "
+                    f"pnl={t['pnl']:.2f} | reason={t['reason']} | "
+                    f"hold_bars={t['hold_bars']:.1f}"
+                )
+        else:
+            self._log("No closed trades today.")
+
+        # Open positions snapshot
+        if self.positions:
+            self._log("-" * 70)
+            self._log("Open positions at end of day:")
+            for sym, pos in self.positions.items():
+                last_price = pos.entry_price
+                buf = self.ohlcv_buffers.get(sym)
+                if buf is not None and not buf.empty:
+                    last_price = float(buf["close"].iloc[-1])
+                unrealized = (last_price - pos.entry_price) * pos.size
+                self._log(
+                    f"  {sym} | size={pos.size} | entry={pos.entry_price:.4f} | "
+                    f"last={last_price:.4f} | unrealized_pnl={unrealized:.2f}"
+                )
+        else:
+            self._log("No open positions at end of day.")
+
+        self._log("=" * 70)
+        self._log("")
+
+    def _maybe_roll_trading_day(self, bar_time: pd.Timestamp) -> None:
+        """
+        Detect when the calendar trading date changes and log/reset daily stats.
+        Called on every new bar before trading logic.
+        """
+        trade_date = bar_time.date()
+
+        # first bar ever
+        if self.current_trading_date is None:
+            self.current_trading_date = trade_date
+            self.start_of_day_equity = self._current_equity()
+            self._log(
+                f"Starting new trading day: {trade_date}, "
+                f"starting_equity={self.start_of_day_equity:.2f}"
+            )
+            return
+
+        # same day, nothing to do
+        if trade_date == self.current_trading_date:
+            return
+
+        # day changed -> log summary for old day, then reset counters for new day
+        self._log_daily_summary(self.current_trading_date)
+
+        # roll forward equity baseline to include realized PnL from previous day
+        self.start_of_day_equity = self._current_equity()
+        self.realized_pnl_today = 0.0
+        self.trades_today.clear()
+        self.last_stop_bar.clear()
+
+        self.current_trading_date = trade_date
+        self._log(
+            f"Rolled to new trading day: {trade_date}, "
+            f"starting_equity={self.start_of_day_equity:.2f}"
+        )
+
     # ------------ bar handling ------------
 
     def _on_bar(self, symbol: str, bar) -> None:
         """Update symbol buffer with a new bar and run exit/entry logic."""
         ts = pd.to_datetime(getattr(bar, "date", dt.datetime.utcnow()))
+
+        # detect & handle new trading day
+        self._maybe_roll_trading_day(ts)
+
         last_price = float(bar.close)
         volume = float(getattr(bar, "volume", 0.0))
 
