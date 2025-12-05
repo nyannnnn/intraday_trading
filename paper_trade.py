@@ -832,19 +832,24 @@ class PaperTrader:
             work_sec = (work_end - work_start).total_seconds()
             self._log(f"[LOOP] Work (poll + positions) took {work_sec:.1f}s this cycle.")
 
+            # Target: keep total loop time around BAR_INTERVAL_MIN minutes.
+            target_cycle_sec = BAR_INTERVAL_MIN * 60
+            sleep_sec = max(1.0, target_cycle_sec - work_sec)
+
             self._log(
-                f"[POLL] Sleeping for {BAR_INTERVAL_MIN} minutes before next poll..."
+                f"[POLL] Sleeping for {sleep_sec:.1f}s "
+                f"to maintain ~{BAR_INTERVAL_MIN}-minute cycle..."
             )
             sleep_start = dt.datetime.now()
-            self.ib.sleep(BAR_INTERVAL_MIN * 60)
+            self.ib.sleep(sleep_sec)
             sleep_end = dt.datetime.now()
-            sleep_sec = (sleep_end - sleep_start).total_seconds()
 
-            loop_end = sleep_end
-            total_sec = (loop_end - loop_start).total_seconds()
+            actual_sleep_sec = (sleep_end - sleep_start).total_seconds()
+            total_sec = (sleep_end - loop_start).total_seconds()
             self._log(
-                f"[LOOP] Slept {sleep_sec:.1f}s; total loop time {total_sec:.1f}s."
+                f"[LOOP] Slept {actual_sleep_sec:.1f}s; total loop time {total_sec:.1f}s."
             )
+
 
 
 def main() -> None:
