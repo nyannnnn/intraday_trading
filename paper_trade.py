@@ -184,6 +184,7 @@ class PaperTrader:
         self.ib.reqAccountUpdates(False)
         return net_liq
 
+
     def _connect_ib_and_setup(self) -> None:
         """Connect to IBKR, load model, create contracts, and init buffers."""
         self._log("Connecting to IBKR TWS/Gateway...")
