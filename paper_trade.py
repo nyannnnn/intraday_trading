@@ -22,12 +22,15 @@ from ib_insync import IB, Stock, MarketOrder
 
 import logging
 import os
+import time
 from logging.handlers import RotatingFileHandler
+import csv
 
 # basic rotating file + console logging
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
+TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
 
 logger = logging.getLogger("paper_trade")
 logger.setLevel(logging.INFO)
@@ -143,6 +146,47 @@ class PaperTrader:
         """Write a line to both file and console logs."""
         logger.info(msg)
 
+    def _append_trade_to_csv(self, trade_record: dict) -> None:
+        """Append a single closed trade to a CSV file for later analysis."""
+        # Make sure log directory exists (should already from global setup)
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+        file_exists = os.path.exists(TRADES_CSV_PATH)
+
+        # Fixed column order for easier downstream analysis
+        fieldnames = [
+            "symbol",
+            "entry_dt",
+            "exit_dt",
+            "entry_price",
+            "exit_price",
+            "size",
+            "pnl",
+            "r_multiple",
+            "reason",
+        ]
+
+        # Convert timestamps to ISO strings so CSV is clean & portable
+        rec = dict(trade_record)
+        entry_dt = rec.get("entry_dt")
+        exit_dt = rec.get("exit_dt")
+
+        if isinstance(entry_dt, (pd.Timestamp, dt.datetime)):
+            rec["entry_dt"] = entry_dt.isoformat()
+        if isinstance(exit_dt, (pd.Timestamp, dt.datetime)):
+            rec["exit_dt"] = exit_dt.isoformat()
+
+        try:
+            with open(TRADES_CSV_PATH, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()  # write header once on first file creation
+                writer.writerow(rec)
+        except Exception as e:
+            # Don't crash trading loop if logging fails; just log the error.
+            self._log(f"[TRADE-LOG-ERROR] Failed to append trade to CSV: {e}")
+
+
     # ------------ time normalization helpers -----------
 
     @staticmethod
@@ -191,7 +235,32 @@ class PaperTrader:
         """Connect to IBKR, load model, create contracts, and init buffers."""
         self._log("Connecting to IBKR TWS/Gateway...")
         self.ib = IB()
-        self.ib.connect("127.0.0.1", 7497, clientId=1)
+
+        max_retries = 10
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.ib.connect("127.0.0.1", 7497, clientId=1)
+                if self.ib.isConnected():
+                    self._log(f"Connected to IBKR on attempt {attempt}.")
+                    break
+            except ConnectionRefusedError as e:
+                self._log(
+                    f"IBKR connection refused (attempt {attempt}/{max_retries}). "
+                    f"Is TWS/IB Gateway running with API enabled? Error: {e}"
+                )
+            except Exception as e:
+                self._log(
+                    f"Unexpected error while connecting to IBKR "
+                    f"(attempt {attempt}/{max_retries}): {e}"
+                )
+
+            if attempt < max_retries:
+                self._log("Sleeping 5 seconds before next connection attempt...")
+                time.sleep(5)
+
+        else:
+            # All attempts failed
+            raise RuntimeError("Could not connect to IBKR after multiple attempts.")
 
         self._log("Fetching IBKR NetLiquidation for starting equity...")
         net_liq = self._ib_net_liquidation()
@@ -221,6 +290,33 @@ class PaperTrader:
         for sym in UNIVERSE:
             self.ohlcv_buffers[sym] = self._empty_buffer()
         self._log("Buffers initialized.")
+
+    def _ensure_ib_connected(self) -> bool:
+        """Ensure IBKR connection is alive; try a quick reconnect if needed."""
+        if self.ib is None:
+            self._log("[IB] No IB instance; cannot trade.")
+            return False
+
+        if self.ib.isConnected():
+            return True
+
+        self._log("[IB] Connection appears lost; attempting to reconnect...")
+        try:
+            # Best-effort cleanup of any stale connection
+            try:
+                self.ib.disconnect()
+            except Exception:
+                pass
+
+            self.ib.connect("127.0.0.1", 7497, clientId=1)
+            if self.ib.isConnected():
+                self._log("[IB] Successfully reconnected to IBKR.")
+                return True
+        except Exception as e:
+            self._log(f"[IB] Reconnect failed: {e}")
+
+        return False
+
 
     @staticmethod
     def _empty_buffer() -> pd.DataFrame:
@@ -513,6 +609,8 @@ class PaperTrader:
             "reason": reason,
         }
         self.trades_today.append(trade_record)
+        self._append_trade_to_csv(trade_record)
+
 
         self._log(
             f"[EXIT-{reason}] {symbol}: size={size}, entry={pos.entry_price:.4f}, "
@@ -679,7 +777,20 @@ class PaperTrader:
                     f"Sleeping for {BAR_INTERVAL_MIN} minutes..."
                 )
                 in_rth_last = False
-                self.ib.sleep(BAR_INTERVAL_MIN * 60)
+
+                # If IB is up, use ib.sleep so event loop stays active; otherwise time.sleep.
+                if self.ib is not None and self.ib.isConnected():
+                    self.ib.sleep(BAR_INTERVAL_MIN * 60)
+                else:
+                    time.sleep(BAR_INTERVAL_MIN * 60)
+                continue
+
+            # Inside RTH: make sure we actually have a live IB connection.
+            if not self._ensure_ib_connected():
+                heartbeat_logger.error(
+                    "[IB] Not connected during RTH; will retry after short sleep."
+                )
+                time.sleep(15)
                 continue
 
             if not in_rth_last:
@@ -687,13 +798,19 @@ class PaperTrader:
                 self._log("Entered regular trading hours; trading enabled.")
                 in_rth_last = True
 
-            self._poll_bars_once()
-            self._log_open_positions()
+            try:
+                self._poll_bars_once()
+                self._log_open_positions()
+            except Exception as e:
+                self._log(f"[ERROR] Exception in polling loop: {e}")
+                # On error, drop back to next iteration and re-check connectivity
+                in_rth_last = False
 
             self._log(
                 f"[POLL] Sleeping for {BAR_INTERVAL_MIN} minutes before next poll..."
             )
             self.ib.sleep(BAR_INTERVAL_MIN * 60)
+
 
 
 def main() -> None:
