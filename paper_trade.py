@@ -73,8 +73,8 @@ from config import (
 from quant.quant_model import build_features_for_symbol
 from backtesting import load_latest_classifier  # same model as backtest
 
-STARTING_EQUITY = 100_000.0
-MAX_BUFFER_LENGTH = 500
+STARTING_EQUITY = 1000_000.0
+MAX_BUFFER_LENGTH = 500 # max bars to keep in OHLCV buffer per symbol
 ORDER_WAIT_TIMEOUT_SEC = 15  # max time to wait for order fills
 
 
