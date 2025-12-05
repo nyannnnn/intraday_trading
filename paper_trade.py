@@ -18,6 +18,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import numpy as np
 from ib_insync import IB, Stock, MarketOrder
 
 import logging
@@ -82,18 +83,28 @@ heartbeat_handler.setFormatter(
 )
 heartbeat_logger.addHandler(heartbeat_handler)
 
-STARTING_EQUITY = 100_000.0
+STARTING_EQUITY = 1000000.0
 
-# Reduced warmup so you can trade earlier in the session
-MIN_BARS_FOR_FEATURES = 12  # was 30; ~1 hour of 5-min bars instead of 2.5h
+# Warmup: number of bars required so rolling features are stable
+MIN_BARS_FOR_FEATURES = 12  # ~1 hour of 5-min bars
+
+# Max buffer length (per symbol) to cap memory
+MAX_BUFFER_LENGTH = 500
+
+# How many days of RTH history to backfill at startup
+BACKFILL_DURATION_STR = "5 D"  # IB durationStr, RTH-only
 
 
 # ================
 # Regular trading hours helper
 # ================
 
-RTH_START = dt.time(9, 00)
+RTH_START = dt.time(9, 0)     # used for heartbeat scheduling
 RTH_END = dt.time(16, 30)
+
+# Actual US equity open used for open warmup logic
+US_EQUITY_OPEN = dt.time(9, 30)
+US_EQUITY_OPEN_WARMUP_END = dt.time(9, 45)  # first 15 minutes after open
 
 try:
     RTH_TZ = ZoneInfo("America/New_York")
@@ -106,7 +117,7 @@ HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
 
 
 def is_rth_now() -> bool:
-    """Return True if current time is within US equity RTH."""
+    """Return True if current time is within US equity RTH (approx)."""
     if RTH_TZ is not None:
         now = dt.datetime.now(RTH_TZ)
     else:
@@ -116,7 +127,7 @@ def is_rth_now() -> bool:
 
 
 def minutes_until_next_rth_open() -> float:
-    """Return minutes until next RTH open (today or tomorrow)."""
+    """Return minutes until next RTH open (based on RTH_START, today or tomorrow)."""
     if RTH_TZ is not None:
         now = dt.datetime.now(RTH_TZ)
     else:
@@ -233,10 +244,16 @@ class PaperTrader:
 
     def _ib_now(self) -> pd.Timestamp:
         """Return 'now' from IBKR's perspective as tz-aware UTC."""
-        if self.ib is None:
-            return self._normalize_ts(pd.Timestamp.utcnow())
-        # Using local system clock as IB reference is fine for paper trading.
+        # For paper trading, using local UTC clock is sufficient.
         return self._normalize_ts(pd.Timestamp.utcnow())
+
+    def _is_within_open_warmup(self, now_ts: pd.Timestamp) -> bool:
+        """Return True if now is within the open warmup window (first N minutes after 9:30)."""
+        if RTH_TZ is None:
+            return False
+        local = now_ts.tz_convert(RTH_TZ)
+        t = local.time()
+        return US_EQUITY_OPEN <= t < US_EQUITY_OPEN_WARMUP_END
 
     # ------------ equity / risk helpers ------------
 
@@ -261,9 +278,7 @@ class PaperTrader:
         """Return True if daily loss exceeds configured fraction."""
         equity_now = self._current_equity()
         drop = (equity_now - self.start_of_day_equity) / self.start_of_day_equity
-        if drop <= -DAILY_LOSS_STOP_FRACTION:
-            return True
-        return False
+        return drop <= -DAILY_LOSS_STOP_FRACTION
 
     def _calc_position_size(self, price: float) -> int:
         """Compute size based on RISK_PER_TRADE_FRACTION and STOP_LOSS_PCT."""
@@ -336,13 +351,71 @@ class PaperTrader:
             buf = self._empty_buffer()
 
         buf.loc[ts] = row
-        # Keep buffer to a reasonable length (mainly memory control)
-        max_len = 500
-        if len(buf) > max_len:
-            buf = buf.iloc[-max_len:]
+        # Clip buffer length
+        if len(buf) > MAX_BUFFER_LENGTH:
+            buf = buf.iloc[-MAX_BUFFER_LENGTH:]
 
         self.ohlcv_buffers[symbol] = buf
         return buf.iloc[-1]
+
+    def _backfill_buffers_on_startup(self) -> None:
+        """Backfill OHLCV buffers with multiple days of 5-min RTH bars at startup."""
+        if self.ib is None or not self.ib.isConnected():
+            self._log("[BACKFILL] IB not connected; skipping backfill.")
+            return
+
+        self._log(
+            f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} of {BAR_INTERVAL_MIN}-min RTH bars for each symbol..."
+        )
+
+        for sym in UNIVERSE:
+            contract = self.contracts[sym]
+            try:
+                bars = self.ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr=BACKFILL_DURATION_STR,
+                    barSizeSetting=f"{BAR_INTERVAL_MIN} mins",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                )
+            except Exception as e:
+                self._log(f"[BACKFILL-ERROR] {sym}: reqHistoricalData failed: {e}")
+                continue
+
+            if not bars:
+                self._log(f"[BACKFILL] {sym}: no bars returned for backfill.")
+                continue
+
+            # Build DataFrame from all returned bars
+            data = []
+            for b in bars:
+                ts = self._normalize_ts(b.date)
+                data.append(
+                    {
+                        "datetime": ts,
+                        "open": b.open,
+                        "high": b.high,
+                        "low": b.low,
+                        "close": b.close,
+                        "volume": b.volume,
+                    }
+                )
+            df = pd.DataFrame(data).set_index("datetime").sort_index()
+
+            if df.empty:
+                self._log(f"[BACKFILL] {sym}: backfill DataFrame empty.")
+                continue
+
+            if len(df) > MAX_BUFFER_LENGTH:
+                df = df.iloc[-MAX_BUFFER_LENGTH:]
+
+            self.ohlcv_buffers[sym] = df
+            self._log(
+                f"[BACKFILL] {sym}: loaded {len(df)} bars, "
+                f"from {df.index[0]} to {df.index[-1]}"
+            )
 
     # ------------ IB connection & setup ------------
 
@@ -405,6 +478,9 @@ class PaperTrader:
         for sym in UNIVERSE:
             self.ohlcv_buffers[sym] = self._empty_buffer()
         self._log("Buffers initialized.")
+
+        # New: multi-day backfill so warmup is instant on restart
+        self._backfill_buffers_on_startup()
 
     def _ensure_ib_connected(self) -> bool:
         """Ensure IBKR connection is alive; attempt quick reconnect if needed."""
@@ -527,9 +603,8 @@ class PaperTrader:
         r_multiple = realized / (STOP_LOSS_PCT * pos.entry_price * size)
 
         self.realized_pnl_today += realized
-        self.last_stop_bar[symbol] = exit_ts if reason == "STOP" else self.last_stop_bar.get(
-            symbol
-        )
+        if reason == "STOP":
+            self.last_stop_bar[symbol] = exit_ts
 
         trade_record = {
             "symbol": symbol,
@@ -671,6 +746,14 @@ class PaperTrader:
             self._log("[DAILY-STOP] Max daily loss reached; skipping new entries.")
             return
 
+        # Optional: skip entries during open warmup window
+        if self._is_within_open_warmup(now_ts):
+            self._log(
+                "[ENTRY-SKIP] Open warmup window (first 15 minutes after 9:30 NY); "
+                "no new entries this cycle."
+            )
+            return
+
         for sym in UNIVERSE:
             if sym in self.positions:
                 continue
@@ -692,8 +775,21 @@ class PaperTrader:
                 continue
             row = panel.iloc[-1]
 
+            # --- NaN/inf guard for live features ---
+            feat_vals = row[FEATURE_COLUMNS]
+            vals = feat_vals.values.astype(float)
+            bad_mask = ~np.isfinite(vals)
+            if bad_mask.any():
+                bad_cols = feat_vals.index[bad_mask].tolist()
+                bar_time = buf.index[-1]
+                self._log(
+                    f"[ENTRY-SKIP] {sym}: NaN/inf in features {bad_cols} at {bar_time}; skipping this bar."
+                )
+                continue
+            # --------------------------------------
+
             # Predict using 1-row DataFrame to preserve feature names
-            x = row[FEATURE_COLUMNS].to_frame().T
+            x = feat_vals.to_frame().T
             p_up = float(self.clf.predict_proba(x)[0, 1])
 
             self._log(
@@ -849,7 +945,6 @@ class PaperTrader:
             self._log(
                 f"[LOOP] Slept {actual_sleep_sec:.1f}s; total loop time {total_sec:.1f}s."
             )
-
 
 
 def main() -> None:
