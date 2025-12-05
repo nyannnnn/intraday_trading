@@ -169,7 +169,8 @@ class PaperTrader:
 
     def _ib_net_liquidation(self) -> Optional[float]:
         """Fetch NetLiquidation from IBKR account values (returns None if unavailable)."""
-        self.ib.reqAccountUpdates(True)
+
+        """ self.ib.reqAccountUpdates(True)
         self.ib.sleep(1)
 
         net_liq = None
@@ -181,8 +182,9 @@ class PaperTrader:
                     net_liq = None
                 break
 
-        self.ib.reqAccountUpdates(False)
-        return net_liq
+        self.ib.reqAccountUpdates(False) """
+
+        return None # temporarily disabled for testing without IBKR connection
 
 
     def _connect_ib_and_setup(self) -> None:
