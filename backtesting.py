@@ -17,12 +17,16 @@ from config import (
     FEATURE_COLUMNS,
     LABEL_COLUMN,
     P_UP_ENTRY_THRESHOLD,
-    FUTURE_HORIZON_BARS,
-    BAR_INTERVAL_MIN,
     RISK_PER_TRADE_FRACTION,
+    BAR_INTERVAL_MIN,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
+    MAX_BARS_IN_TRADE,
+    MAX_CONCURRENT_POSITIONS,
+    COOLDOWN_BARS_AFTER_STOP,
+    DAILY_LOSS_STOP_FRACTION,
 )
+
 
 from quant.quant_model import build_panel_features_and_labels
 
@@ -131,42 +135,52 @@ def run_backtest(
     panel_with_features: pd.DataFrame,
     panel_ohlcv: pd.DataFrame,
     clf,
-    start_equity: float = 100_000.0,
+    start_equity: float = 1000000.0,
+    threshold_override: float | None = None,
 ) -> BacktestResult:
-    """Run an offline horizon-based backtest of the ML signal with simple risk caps."""
-    print("=== Step 4: Run backtest ===")
+    """Backtest using live-style SL/TP/MAX_BARS exits and live-style risk controls."""
+    entry_thr = P_UP_ENTRY_THRESHOLD if threshold_override is None else threshold_override
+    print("=== Step 4: Run backtest (live-style exits + risk controls) ===")
 
     df = panel_with_features.copy()
 
-    needed = FEATURE_COLUMNS + ["future_ret", LABEL_COLUMN]
+    needed = FEATURE_COLUMNS + ["open", "high", "low", "close", LABEL_COLUMN]
     for col in needed:
         if col not in df.columns:
             raise ValueError(f"Column '{col}' missing in panel_with_features.")
 
-    df = df.dropna(subset=FEATURE_COLUMNS + ["future_ret"])
-    df = df.sort_index()
+    # ----- model probabilities & classification metrics -----
+    feat_mask = df[FEATURE_COLUMNS].notna().all(axis=1)
+    proba = np.full(len(df), np.nan)
+    if feat_mask.any():
+        X = df.loc[feat_mask, FEATURE_COLUMNS].values
+        proba[feat_mask.to_numpy()] = clf.predict_proba(X)[:, 1]
+    df["proba_up"] = proba
 
-    X = df[FEATURE_COLUMNS]
-    proba_up = clf.predict_proba(X)[:, 1]
-    df["proba_up"] = proba_up
-
-    y_true = df[LABEL_COLUMN].astype(int)
-    try:
-        val_auc = roc_auc_score(y_true, proba_up)
-    except ValueError:
+    valid_mask = (~df["proba_up"].isna()) & df[LABEL_COLUMN].notna()
+    if valid_mask.any():
+        y_true = df.loc[valid_mask, LABEL_COLUMN].astype(int)
+        y_score = df.loc[valid_mask, "proba_up"].astype(float)
+        try:
+            val_auc = roc_auc_score(y_true, y_score)
+        except ValueError:
+            val_auc = np.nan
+        y_pred = (y_score >= entry_thr).astype(int)
+        val_acc = accuracy_score(y_true, y_pred)
+    else:
         val_auc = np.nan
-    y_pred = (proba_up >= P_UP_ENTRY_THRESHOLD).astype(int)
-    val_acc = accuracy_score(y_true, y_pred)
+        val_acc = np.nan
 
-    trades = df[df["proba_up"] >= P_UP_ENTRY_THRESHOLD].copy()
-    if trades.empty:
+    # If nothing ever crosses the threshold, return flat equity
+    trigger_mask = df["proba_up"] >= entry_thr
+    if not trigger_mask.any():
         print("No trades triggered by the ML model with current threshold.")
         all_dts = (
             panel_ohlcv.index.get_level_values("datetime")
             .sort_values()
             .unique()
         )
-        equity = pd.Series(start_equity, index=all_dts, name="equity")
+        equity = pd.Series(start_equity, index=all_dts, name="strategy_equity")
         bh_equity = build_buy_and_hold_equity(panel_ohlcv, start_equity)
 
         metrics = {
@@ -184,46 +198,256 @@ def run_backtest(
             "val_accuracy_backtest": val_acc,
         }
 
+        trades_empty = pd.DataFrame(
+            columns=[
+                "symbol",
+                "entry_dt",
+                "exit_dt",
+                "entry_price",
+                "exit_price",
+                "size",
+                "pnl",
+                "r_multiple",
+                "trade_ret",
+                "reason",
+                "p_up",
+            ]
+        )
+
         return BacktestResult(
             equity=equity,
             buy_hold_equity=bh_equity,
-            trades=trades,
+            trades=trades_empty,
             metrics=metrics,
         )
 
-    trades = trades.reset_index()
-    trades = trades.rename(columns={"datetime": "entry_dt"})
+    # ----- sort by time & symbol for bar-by-bar simulation -----
+    df_reset = df.reset_index().rename(columns={"datetime": "dt"})
+    df_reset["dt"] = pd.to_datetime(df_reset["dt"])
+    df_reset = df_reset.sort_values(["dt", "symbol"]).reset_index(drop=True)
 
-    horiz_minutes = FUTURE_HORIZON_BARS * BAR_INTERVAL_MIN
-    trades["exit_dt"] = trades["entry_dt"] + pd.to_timedelta(horiz_minutes, unit="m")
+    equity_idx = []
+    equity_vals = []
 
-    trades["future_ret"] = trades["future_ret"].astype(float)
-    trades["trade_ret_raw"] = trades["future_ret"]
-    trades["trade_ret"] = trades["future_ret"].clip(
-        lower=-STOP_LOSS_PCT, upper=TAKE_PROFIT_PCT
+    # Realized PnL tracking
+    realized_pnl_cum = 0.0          # total realized over whole backtest
+    realized_pnl_today = 0.0        # realized within current trading date
+
+    positions: dict[str, dict] = {}
+    last_stop_bar: dict[str, pd.Timestamp] = {}
+
+    trades_out = []
+
+    current_trading_date: Optional[dt.date] = None
+    daily_loss_stop_active = False   # block new entries once hit for the day
+
+    def unrealized_pnl() -> float:
+        """Unrealized PnL over all open positions."""
+        total = 0.0
+        for pos in positions.values():
+            total += (pos["last_price"] - pos["entry_price"]) * pos["size"]
+        return total
+
+    def equity_for_risk() -> float:
+        """Equity notion used for risk sizing / daily-loss-stop (matches live style)."""
+        return start_equity + realized_pnl_today + unrealized_pnl()
+
+    def equity_for_curve() -> float:
+        """Equity notion used for equity curve / final metrics."""
+        return start_equity + realized_pnl_cum + unrealized_pnl()
+
+    bar_dt_unit = pd.to_timedelta(BAR_INTERVAL_MIN, unit="m")
+
+    # ----- main time loop: exits, risk checks, entries, equity mark -----
+    for dt_val, frame in df_reset.groupby("dt"):
+        trade_date = dt_val.date()
+
+        # roll to new trading date
+        if current_trading_date is None or trade_date != current_trading_date:
+            current_trading_date = trade_date
+            realized_pnl_today = 0.0
+            daily_loss_stop_active = False
+
+        just_exited = set()
+
+        # 1) exits and mark latest prices
+        for _, row in frame.iterrows():
+            sym = row["symbol"]
+            close_px = float(row["close"])
+            high_px = float(row["high"])
+
+            if sym in positions:
+                pos = positions[sym]
+                pos["bars_held"] += 1
+                pos["last_price"] = close_px
+
+                exit_price = None
+                reason = None
+
+                if close_px <= pos["stop_price"]:
+                    exit_price = close_px
+                    reason = "STOP"
+                elif high_px >= pos["take_profit_price"]:
+                    exit_price = pos["take_profit_price"]
+                    reason = "TP"
+                elif pos["bars_held"] >= MAX_BARS_IN_TRADE:
+                    exit_price = close_px
+                    reason = "MAX_BARS"
+
+                if exit_price is not None:
+                    pnl = (exit_price - pos["entry_price"]) * pos["size"]
+                    realized_pnl_cum += pnl
+                    realized_pnl_today += pnl
+
+                    risk_per_share = pos["entry_price"] * STOP_LOSS_PCT
+                    denom = risk_per_share * pos["size"] if risk_per_share > 0 else np.nan
+                    r_mult = pnl / denom if denom and denom != 0 else np.nan
+
+                    notional = pos["entry_price"] * pos["size"]
+                    trade_ret = pnl / notional if notional != 0 else np.nan
+
+                    trades_out.append(
+                        {
+                            "symbol": sym,
+                            "entry_dt": pos["entry_dt"],
+                            "exit_dt": dt_val,
+                            "entry_price": pos["entry_price"],
+                            "exit_price": exit_price,
+                            "size": pos["size"],
+                            "pnl": pnl,
+                            "r_multiple": r_mult,
+                            "trade_ret": trade_ret,
+                            "reason": reason,
+                            "p_up": pos["p_up"],
+                            "bars_held": pos["bars_held"],
+                        }
+                    )
+
+                    if reason == "STOP":
+                        last_stop_bar[sym] = dt_val
+
+                    del positions[sym]
+                    just_exited.add(sym)
+
+        # 2) update daily loss stop status based on risk equity
+        eq_risk = equity_for_risk()
+        drawdown = (eq_risk - start_equity) / start_equity
+        if drawdown <= -DAILY_LOSS_STOP_FRACTION:
+            daily_loss_stop_active = True
+
+        # 3) entries based on ML signal, risk sizing, concurrency, cooldown, daily stop
+        for _, row in frame.iterrows():
+            sym = row["symbol"]
+
+            # no new entries if:
+            # - already have position
+            # - just exited this bar
+            # - daily loss stop hit
+            # - max concurrent positions reached
+            if (
+                sym in positions
+                or sym in just_exited
+                or daily_loss_stop_active
+                or len(positions) >= MAX_CONCURRENT_POSITIONS
+            ):
+                continue
+
+            p_up = row["proba_up"]
+            if pd.isna(p_up) or p_up < entry_thr:
+                continue
+
+            # per-symbol cooldown after STOP
+            last_stop = last_stop_bar.get(sym)
+            if last_stop is not None:
+                bars_since_stop = (dt_val - last_stop) / bar_dt_unit
+                if bars_since_stop < COOLDOWN_BARS_AFTER_STOP:
+                    continue
+
+            eq_now = equity_for_risk()
+            close_px = float(row["close"])
+
+            stop_price = close_px * (1.0 - STOP_LOSS_PCT)
+            risk_per_share = close_px - stop_price
+            if risk_per_share <= 0:
+                continue
+
+            risk_capital = eq_now * RISK_PER_TRADE_FRACTION
+            size = int(risk_capital / risk_per_share)
+            if size <= 0:
+                continue
+
+            positions[sym] = {
+                "entry_price": close_px,
+                "stop_price": stop_price,
+                "take_profit_price": close_px * (1.0 + TAKE_PROFIT_PCT),
+                "size": size,
+                "entry_dt": dt_val,
+                "bars_held": 0,
+                "last_price": close_px,
+                "p_up": float(p_up),
+            }
+
+        # 4) mark equity at end of this bar time (curve equity)
+        eq_curve = equity_for_curve()
+        equity_idx.append(dt_val)
+        equity_vals.append(eq_curve)
+
+    # ----- force-close remaining positions at final mark -----
+    if positions:
+        final_dt = equity_idx[-1]
+        for sym, pos in list(positions.items()):
+            exit_price = pos["last_price"]
+            pnl = (exit_price - pos["entry_price"]) * pos["size"]
+            realized_pnl_cum += pnl
+            realized_pnl_today += pnl
+
+            risk_per_share = pos["entry_price"] * STOP_LOSS_PCT
+            denom = risk_per_share * pos["size"] if risk_per_share > 0 else np.nan
+            r_mult = pnl / denom if denom and denom != 0 else np.nan
+
+            notional = pos["entry_price"] * pos["size"]
+            trade_ret = pnl / notional if notional != 0 else np.nan
+
+            trades_out.append(
+                {
+                    "symbol": sym,
+                    "entry_dt": pos["entry_dt"],
+                    "exit_dt": final_dt,
+                    "entry_price": pos["entry_price"],
+                    "exit_price": exit_price,
+                    "size": pos["size"],
+                    "pnl": pnl,
+                    "r_multiple": r_mult,
+                    "trade_ret": trade_ret,
+                    "reason": "EOD_FORCED",
+                    "p_up": pos["p_up"],
+                    "bars_held": pos["bars_held"],
+                }
+            )
+
+            del positions[sym]
+
+        # last equity point after final realization
+        equity_vals[-1] = equity_for_curve()
+
+    equity = pd.Series(
+        equity_vals,
+        index=pd.to_datetime(equity_idx),
+        name="strategy_equity",
     )
 
-    notional_per_trade = start_equity * RISK_PER_TRADE_FRACTION
-    trades["pnl_dollars"] = notional_per_trade * trades["trade_ret"]
-
-    trades["entry_price"] = trades["close"]
-    trades["exit_price_est"] = trades["entry_price"] * (1.0 + trades["trade_ret"])
-
-    pnl_by_exit = trades.groupby("exit_dt")["pnl_dollars"].sum().sort_index()
-    equity = pnl_by_exit.cumsum() + start_equity
-    equity.name = "strategy_equity"
-
-    all_dts = (
-        panel_ohlcv.index.get_level_values("datetime")
-        .sort_values()
-        .unique()
-    )
-    equity = equity.reindex(all_dts, method="ffill").fillna(start_equity)
-
+    # ----- benchmark & metrics -----
     buy_hold_equity = build_buy_and_hold_equity(panel_ohlcv, start_equity)
+    buy_hold_equity = (
+        buy_hold_equity.reindex(equity.index)
+        .ffill()
+        .bfill()
+    )
+
+    trades_df = pd.DataFrame(trades_out)
 
     returns = equity.pct_change().fillna(0.0)
-    total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
+    total_return = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
 
     if len(equity.index) > 1:
         n_years = (equity.index[-1] - equity.index[0]).days / 365.25
@@ -235,33 +459,42 @@ def run_backtest(
         cagr = np.nan
 
     if returns.std() > 0:
-        sharpe = np.sqrt(252.0) * returns.mean() / returns.std()
+        sharpe = float(np.sqrt(252.0) * returns.mean() / returns.std())
     else:
         sharpe = np.nan
 
     roll_max = equity.cummax()
     drawdown = (equity - roll_max) / roll_max
-    max_dd = drawdown.min()
+    max_dd = float(drawdown.min())
 
-    n_trades = len(trades)
-    win_mask = trades["trade_ret"] > 0
-    lose_mask = trades["trade_ret"] < 0
+    n_trades = len(trades_df)
+    if n_trades > 0:
+        win_mask = trades_df["trade_ret"] > 0
+        lose_mask = trades_df["trade_ret"] < 0
 
-    win_rate = win_mask.mean() if n_trades > 0 else np.nan
-    avg_gain = trades.loc[win_mask, "trade_ret"].mean() if win_mask.any() else np.nan
-    avg_loss = trades.loc[lose_mask, "trade_ret"].mean() if lose_mask.any() else np.nan
+        win_rate = float(win_mask.mean())
+        avg_gain = (
+            float(trades_df.loc[win_mask, "trade_ret"].mean()) if win_mask.any() else np.nan
+        )
+        avg_loss = (
+            float(trades_df.loc[lose_mask, "trade_ret"].mean()) if lose_mask.any() else np.nan
+        )
+    else:
+        win_rate = np.nan
+        avg_gain = np.nan
+        avg_loss = np.nan
 
     metrics = {
-        "total_return": float(total_return),
+        "total_return": total_return,
         "CAGR": float(cagr) if pd.notna(cagr) else np.nan,
-        "sharpe": float(sharpe) if pd.notna(sharpe) else np.nan,
-        "max_drawdown": float(max_dd),
+        "sharpe": sharpe,
+        "max_drawdown": max_dd,
         "final_equity": float(equity.iloc[-1]),
         "start_equity": float(equity.iloc[0]),
         "n_trades": int(n_trades),
-        "win_rate": float(win_rate) if pd.notna(win_rate) else np.nan,
-        "avg_gain": float(avg_gain) if pd.notna(avg_gain) else np.nan,
-        "avg_loss": float(avg_loss) if pd.notna(avg_loss) else np.nan,
+        "win_rate": win_rate,
+        "avg_gain": avg_gain,
+        "avg_loss": avg_loss,
         "val_auc_backtest": float(val_auc) if pd.notna(val_auc) else np.nan,
         "val_accuracy_backtest": float(val_acc) if pd.notna(val_acc) else np.nan,
     }
@@ -269,9 +502,49 @@ def run_backtest(
     return BacktestResult(
         equity=equity,
         buy_hold_equity=buy_hold_equity,
-        trades=trades,
+        trades=trades_df,
         metrics=metrics,
     )
+
+
+def sweep_entry_thresholds(
+    panel_with_features: pd.DataFrame,
+    panel_ohlcv: pd.DataFrame,
+    clf,
+    thresholds: list[float],
+    start_equity: float = 100_000.0,
+) -> pd.DataFrame:
+    """Sweep p_up entry thresholds and summarize key backtest metrics."""
+    rows = []
+
+    for thr in thresholds:
+        print("\n" + "=" * 60)
+        print(f"Sweep run for entry threshold = {thr:.3f}")
+        print("=" * 60)
+
+        result = run_backtest(
+            panel_with_features,
+            panel_ohlcv,
+            clf,
+            start_equity=start_equity,
+            threshold_override=thr,
+        )
+        m = result.metrics
+
+        rows.append(
+            {
+                "threshold": thr,
+                "n_trades": m["n_trades"],
+                "sharpe": m["sharpe"],
+                "max_drawdown": m["max_drawdown"],
+                "total_return": m["total_return"],
+            }
+        )
+
+    df_res = pd.DataFrame(rows).set_index("threshold")
+    print("\n=== Threshold sweep summary ===")
+    print(df_res.to_string(float_format=lambda x: f"{x: .4f}"))
+    return df_res
 
 
 def analyze_proba_buckets(panel_with_features: pd.DataFrame, clf) -> None:
@@ -329,6 +602,85 @@ def analyze_proba_buckets(panel_with_features: pd.DataFrame, clf) -> None:
     with pd.option_context("display.float_format", "{:0.5f}".format):
         print(stats.to_string(index=False))
 
+def print_backtest_summary(result: BacktestResult) -> None:
+    """Print key backtest metrics and a short trade sample."""
+    m = result.metrics
+
+    print("\nBacktest metrics:")
+    print(f"  total_return: {m['total_return']:.4f}")
+    print(f"  CAGR: {m['CAGR']:.4f}")
+    print(f"  sharpe: {m['sharpe']:.4f}")
+    print(f"  max_drawdown: {m['max_drawdown']:.4f}")
+    print(f"  final_equity: {m['final_equity']:.4f}")
+    print(f"  start_equity: {m['start_equity']:.4f}")
+    print(f"  n_trades: {m['n_trades']}")
+    print(f"  win_rate: {m['win_rate']:.4f}" if m["n_trades"] > 0 else "  win_rate: nan")
+    print(f"  avg_gain: {m['avg_gain']:.4f}" if m["n_trades"] > 0 else "  avg_gain: nan")
+    print(f"  avg_loss: {m['avg_loss']:.4f}" if m["n_trades"] > 0 else "  avg_loss: nan")
+    print(f"  val_auc_backtest: {m['val_auc_backtest']:.4f}")
+    print(f"  val_accuracy_backtest: {m['val_accuracy_backtest']:.4f}")
+
+    trades = result.trades
+    if trades is not None and not trades.empty:
+        cols = ["symbol", "entry_dt", "exit_dt", "entry_price", "trade_ret"]
+        print("\nTrade summary (first 10 trades):")
+        print(trades[cols].head(10).to_string(index=False))
+    else:
+        print("\nNo trades to display.")
+
+def summarize_trades_by_symbol(result: BacktestResult) -> None:
+    """Summarize performance by symbol (n trades, PnL, returns, win rate)."""
+    trades = result.trades
+    if trades is None or trades.empty:
+        print("\n[Symbol summary] No trades to summarize.")
+        return
+
+    df = trades.copy()
+    # Ensure trade_ret exists; if not, derive from pnl and entry_price*size
+    if "trade_ret" not in df.columns or df["trade_ret"].isna().all():
+        notional = df["entry_price"] * df["size"].abs()
+        df["trade_ret"] = df["pnl"] / notional.replace(0, np.nan)
+
+    # Aggregate by symbol
+    grouped = df.groupby("symbol")
+    summary = grouped.agg(
+        n_trades=("symbol", "count"),
+        total_pnl=("pnl", "sum"),
+        avg_pnl=("pnl", "mean"),
+        avg_ret=("trade_ret", "mean"),
+        win_rate=("trade_ret", lambda x: (x > 0).mean()),
+    )
+
+    # Sort by total_pnl descending so you see biggest contributors first
+    summary = summary.sort_values("total_pnl", ascending=False)
+
+    print("\n=== Symbol-level performance summary ===")
+    print(summary.to_string(float_format=lambda x: f"{x: .4f}"))
+
+def summarize_trades_by_holding_period(result: BacktestResult) -> None:
+    """Summarize performance by holding duration in bars."""
+    trades = result.trades
+    if trades is None or trades.empty or "bars_held" not in trades.columns:
+        print("\n[Holding-period summary] No trades or bars_held not tracked.")
+        return
+
+    df = trades.copy()
+
+    # Define some rough buckets: 0–3, 4–6, 7–12, 13–24, 25+ bars
+    bins = [0, 3, 6, 12, 24, np.inf]
+    labels = ["0–3", "4–6", "7–12", "13–24", "25+"]
+    df["bars_bucket"] = pd.cut(df["bars_held"], bins=bins, labels=labels, right=True)
+
+    grouped = df.groupby("bars_bucket")
+    summary = grouped.agg(
+        n_trades=("bars_held", "count"),
+        avg_ret=("trade_ret", "mean"),
+        win_rate=("trade_ret", lambda x: (x > 0).mean()),
+    )
+
+    print("\n=== Holding-period performance summary (bars_held) ===")
+    print(summary.to_string(float_format=lambda x: f"{x: .44f}"))
+
 
 def main():
     """Run offline backtest, print diagnostics, and persist curves/logs to disk."""
@@ -350,6 +702,29 @@ def main():
     # New: bucket analysis for proba_up -> future_ret
     analyze_proba_buckets(panel_with_features, clf)
 
+    thresholds = [0.50, 0.55, 0.60, 0.65, 0.70]
+    sweep_df = sweep_entry_thresholds(
+        panel_with_features,
+        panel_ohlcv,
+        clf,
+        thresholds=thresholds,
+        start_equity=100_000.0,
+    )
+
+    # 2) optionally run once at your current config threshold for full detail
+    #    (using the threshold from config.py)
+    print("\n\n=== Full backtest at config threshold ===")
+    result = run_backtest(
+        panel_with_features,
+        panel_ohlcv,
+        clf,
+        start_equity=100_000.0,
+        threshold_override=None,  # use P_UP_ENTRY_THRESHOLD from config
+    )
+    print_backtest_summary(result)
+    summarize_trades_by_symbol(result)
+    summarize_trades_by_holding_period(result)
+
     result = run_backtest(panel_with_features, panel_ohlcv, clf, start_equity=100_000.0)
 
     equity = result.equity
@@ -364,34 +739,12 @@ def main():
         else:
             print(f"  {k}: {v}")
 
-    if not trades.empty:
-        print("\nTrade summary (first 10 trades):")
-        cols = [
-            "symbol",
-            "entry_dt",
-            "exit_dt",
-            "entry_price",
-            "exit_price_est",
-            "proba_up",
-            "trade_ret",
-            "pnl_dollars",
-        ]
-        cols = [c for c in cols if c in trades.columns]
-        print(trades[cols].head(10).to_string(index=False))
-
-        trades_path = project_root / "trades.csv"
-        trades.to_csv(trades_path, index=False)
-        print(f"\nSaved full trade log to {trades_path}")
-
     equity_df = pd.DataFrame(
         {
             "strategy_equity": equity,
             "buy_hold_equity": buy_hold_equity.reindex(equity.index, method="ffill"),
         }
     )
-    eq_path = project_root / "equity_curve.csv"
-    equity_df.to_csv(eq_path)
-    print(f"Saved equity curves to {eq_path}")
 
     plt.figure(figsize=(11, 5))
     plt.plot(equity.index, equity.values, label="ML strategy")
@@ -407,10 +760,6 @@ def main():
     plt.title("ML Strategy vs Buy & Hold")
     plt.legend()
     plt.tight_layout()
-
-    plot_path = project_root / "equity_vs_buyhold.png"
-    plt.savefig(plot_path, dpi=150)
-    print(f"Saved equity comparison plot to {plot_path}")
 
     plt.show()
 
