@@ -570,9 +570,25 @@ class PaperTrader:
             self._log("[ORDER] No fills received before timeout; treating as no fill.")
             return None
 
-        avg_price = sum(f.fillPrice * f.execution.shares for f in fills) / sum(
-            f.execution.shares for f in fills
-        )
+        try:
+            # Use execution.price and execution.shares from each Fill
+            total_shares = sum(abs(f.execution.shares) for f in fills)
+            if total_shares == 0:
+                self._log(
+                    "[ORDER] Fills received but total_shares=0; treating as no fill."
+                )
+                return None
+
+            avg_price = sum(
+                f.execution.price * abs(f.execution.shares) for f in fills
+            ) / total_shares
+        except Exception as e:
+            # Fallback to orderStatus.avgFillPrice if something unexpected happens
+            self._log(
+                f"[ORDER] Error computing avg fill price from fills: {e}. "
+                f"Falling back to trade.orderStatus.avgFillPrice={trade.orderStatus.avgFillPrice}"
+            )
+            avg_price = float(trade.orderStatus.avgFillPrice or 0.0)
 
         self._log(
             f"[ORDER-FILLED] {action} {abs(size)} {symbol} avg_price={avg_price:.4f}"
@@ -581,6 +597,7 @@ class PaperTrader:
         return SimpleNamespace(
             avg_price=avg_price, size=size, action=action, raw_trade=trade
         )
+
 
     def _close_position(
         self,
