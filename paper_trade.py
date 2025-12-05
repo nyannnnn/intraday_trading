@@ -69,7 +69,7 @@ console_handler.setFormatter(
 )
 logger.addHandler(console_handler)
 
-# Separate heartbeat logger (only used outside RTH)
+# Separate heartbeat logger (used outside RTH)
 heartbeat_logger = logging.getLogger("paper_trade_heartbeat")
 heartbeat_logger.setLevel(logging.INFO)
 heartbeat_handler = RotatingFileHandler(
@@ -82,15 +82,18 @@ heartbeat_handler.setFormatter(
 )
 heartbeat_logger.addHandler(heartbeat_handler)
 
-
 STARTING_EQUITY = 100_000.0
+
+# Reduced warmup so you can trade earlier in the session
+MIN_BARS_FOR_FEATURES = 12  # was 30; ~1 hour of 5-min bars instead of 2.5h
+
 
 # ================
 # Regular trading hours helper
 # ================
 
-RTH_START = dt.time(9, 30)
-RTH_END = dt.time(16, 0)
+RTH_START = dt.time(9, 00)
+RTH_END = dt.time(16, 30)
 
 try:
     RTH_TZ = ZoneInfo("America/New_York")
@@ -333,7 +336,7 @@ class PaperTrader:
             buf = self._empty_buffer()
 
         buf.loc[ts] = row
-        # Keep buffer to a reasonable length
+        # Keep buffer to a reasonable length (mainly memory control)
         max_len = 500
         if len(buf) > max_len:
             buf = buf.iloc[-max_len:]
@@ -590,31 +593,44 @@ class PaperTrader:
         )
 
     def _poll_bars_once(self) -> None:
-        """Fetch latest bars for all symbols, manage entries and exits."""
+        """Fetch latest bars for all symbols, manage exits, then entries."""
         now_ts = self._ib_now()
         self._maybe_roll_trading_date(now_ts)
 
-        # Fetch latest bar for each symbol
+        # === 1) Fetch latest bar for each symbol ===
         for sym in UNIVERSE:
             contract = self.contracts[sym]
-            # Get last completed bar
-            bars = self.ib.reqHistoricalData(
-                contract,
-                endDateTime="",
-                durationStr=f"{BAR_INTERVAL_MIN * 2} M",
-                barSizeSetting=f"{BAR_INTERVAL_MIN} mins",
-                whatToShow="TRADES",
-                useRTH=True,
-                formatDate=1,
-            )
+            try:
+                bars = self.ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr=f"{BAR_INTERVAL_MIN * 2} M",
+                    barSizeSetting=f"{BAR_INTERVAL_MIN} mins",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                )
+            except Exception as e:
+                self._log(f"[BAR-ERROR] {sym}: reqHistoricalData failed: {e}")
+                continue
+
             if not bars:
+                self._log(f"[BAR] {sym}: no bars returned from IBKR.")
                 continue
 
             last = self._update_buffer_from_bars(sym, bars)
             if last is None:
+                self._log(f"[BAR] {sym}: buffer update returned None.")
                 continue
 
-        # Exits first: use the latest bar close/high/low
+            buf = self.ohlcv_buffers.get(sym)
+            buf_len = len(buf) if buf is not None else 0
+            self._log(
+                f"[BAR] {sym}: last_close={float(last['close']):.4f}, "
+                f"buffer_len={buf_len}"
+            )
+
+        # === 2) Exits first: use the latest bar close/high/low ===
         for sym, pos in list(self.positions.items()):
             buf = self.ohlcv_buffers.get(sym)
             if buf is None or buf.empty:
@@ -627,22 +643,32 @@ class PaperTrader:
 
             # Stop-loss if low breaches stop
             if low <= pos.stop_price:
+                self._log(
+                    f"[EXIT-CHECK] {sym}: STOP hit (low={low:.4f} <= SL={pos.stop_price:.4f})"
+                )
                 self._close_position(sym, pos, pos.stop_price, last_ts, reason="STOP")
                 continue
 
             # Take-profit if high breaches TP
             if high >= pos.take_profit_price:
+                self._log(
+                    f"[EXIT-CHECK] {sym}: TP hit (high={high:.4f} >= TP={pos.take_profit_price:.4f})"
+                )
                 self._close_position(sym, pos, pos.take_profit_price, last_ts, reason="TP")
                 continue
 
             # Time stop: max bars in trade
             bars_held = (last_ts - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
             if bars_held >= MAX_BARS_IN_TRADE:
+                self._log(
+                    f"[EXIT-CHECK] {sym}: MAX_BARS reached ({bars_held:.1f} >= {MAX_BARS_IN_TRADE})"
+                )
                 self._close_position(sym, pos, close, last_ts, reason="MAX_BARS")
                 continue
 
-        # Entries: only if daily loss not hit
+        # === 3) Entries (only if daily loss not hit) ===
         if self._max_daily_loss_reached():
+            self._log("[DAILY-STOP] Max daily loss reached; skipping new entries.")
             return
 
         for sym in UNIVERSE:
@@ -650,12 +676,19 @@ class PaperTrader:
                 continue
 
             buf = self.ohlcv_buffers.get(sym)
-            if buf is None or len(buf) < 30:
+            if buf is None:
+                self._log(f"[ENTRY-SKIP] {sym}: no buffer yet.")
+                continue
+            if len(buf) < MIN_BARS_FOR_FEATURES:
+                self._log(
+                    f"[ENTRY-SKIP] {sym}: buffer_len={len(buf)} < {MIN_BARS_FOR_FEATURES} (warmup)."
+                )
                 continue  # need enough history for features
 
             # Build features using same logic as training/backtest
             panel = build_features_for_symbol(buf)
             if panel.empty:
+                self._log(f"[ENTRY-SKIP] {sym}: feature panel empty.")
                 continue
             row = panel.iloc[-1]
 
@@ -663,20 +696,31 @@ class PaperTrader:
             x = row[FEATURE_COLUMNS].to_frame().T
             p_up = float(self.clf.predict_proba(x)[0, 1])
 
+            self._log(
+                f"[SIGNAL] {sym}: p_up={p_up:.3f}, "
+                f"threshold={P_UP_ENTRY_THRESHOLD:.3f}"
+            )
+
             if p_up < P_UP_ENTRY_THRESHOLD:
+                self._log(f"[ENTRY-SKIP] {sym}: p_up below threshold.")
                 continue
 
             bar_time = buf.index[-1]
             if not self._position_risk_ok(sym, bar_time):
+                self._log(f"[ENTRY-SKIP] {sym}: position risk check failed.")
                 continue
 
             price = float(row["close"])
             size = self._calc_position_size(price)
             if size <= 0:
+                self._log(
+                    f"[ENTRY-SKIP] {sym}: calc size <= 0 at price={price:.4f}."
+                )
                 continue
 
             fills = self._submit_market_order(sym, size)
             if fills is None:
+                self._log(f"[ENTRY-SKIP] {sym}: market order returned no fills.")
                 continue
 
             entry_price = fills.avg_price
@@ -715,7 +759,7 @@ class PaperTrader:
     # ------------ main loop ------------
 
     def run(self) -> None:
-        """Main loop: RTH-only trading; hourly heartbeat outside RTH."""
+        """Main loop: RTH-only trading; hourly heartbeat outside RTH with loop timing."""
         self._log("Initializing paper trader...")
         self.connect_and_load()
         self._load_existing_ib_positions()
@@ -727,6 +771,7 @@ class PaperTrader:
         in_rth_last = False
 
         while True:
+            loop_start = dt.datetime.now()
             in_rth_now = is_rth_now()
 
             if not in_rth_now:
@@ -738,7 +783,7 @@ class PaperTrader:
                 if minutes_to_open > HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH:
                     sleep_minutes = HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH
                 else:
-                    # Within last hour: sleep straight into the open
+                    # Within last hour: sleep straight into the open (min 1 minute)
                     sleep_minutes = max(1.0, minutes_to_open)
 
                 heartbeat_logger.info(
@@ -749,12 +794,18 @@ class PaperTrader:
                 in_rth_last = False
 
                 if self.ib is not None and self.ib.isConnected():
+                    sleep_start = dt.datetime.now()
                     self.ib.sleep(sleep_minutes * 60)
+                    sleep_end = dt.datetime.now()
+                    heartbeat_logger.info(
+                        f"[HEARTBEAT] Slept {(sleep_end - sleep_start).total_seconds():.1f}s outside RTH."
+                    )
                 else:
                     time.sleep(sleep_minutes * 60)
                 continue
 
             # === Inside regular trading hours (RTH) ===
+            work_start = dt.datetime.now()
 
             # Ensure we have a live IB connection; no heartbeat logs here.
             if not self._ensure_ib_connected():
@@ -777,10 +828,23 @@ class PaperTrader:
                 self._log(f"[ERROR] Exception in polling loop: {e}")
                 in_rth_last = False
 
+            work_end = dt.datetime.now()
+            work_sec = (work_end - work_start).total_seconds()
+            self._log(f"[LOOP] Work (poll + positions) took {work_sec:.1f}s this cycle.")
+
             self._log(
                 f"[POLL] Sleeping for {BAR_INTERVAL_MIN} minutes before next poll..."
             )
+            sleep_start = dt.datetime.now()
             self.ib.sleep(BAR_INTERVAL_MIN * 60)
+            sleep_end = dt.datetime.now()
+            sleep_sec = (sleep_end - sleep_start).total_seconds()
+
+            loop_end = sleep_end
+            total_sec = (loop_end - loop_start).total_seconds()
+            self._log(
+                f"[LOOP] Slept {sleep_sec:.1f}s; total loop time {total_sec:.1f}s."
+            )
 
 
 def main() -> None:
