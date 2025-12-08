@@ -27,6 +27,10 @@ import csv
 import time
 from logging.handlers import RotatingFileHandler
 
+import smtplib
+import traceback
+from email.mime.text import MIMEText
+
 from config import (
     UNIVERSE,
     MODEL_DIR,
@@ -83,7 +87,7 @@ heartbeat_handler.setFormatter(
 )
 heartbeat_logger.addHandler(heartbeat_handler)
 
-STARTING_EQUITY = 1000000.0
+STARTING_EQUITY = 100000.0
 
 # Warmup: number of bars required so rolling features are stable
 MIN_BARS_FOR_FEATURES = 12  # ~1 hour of 5-min bars
@@ -93,6 +97,17 @@ MAX_BUFFER_LENGTH = 500
 
 # How many days of RTH history to backfill at startup
 BACKFILL_DURATION_STR = "5 D"  # IB durationStr, RTH-only
+
+# ================
+# Email alert config (set via environment variables in production)
+# ================
+
+ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")       # required for alerts
+ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")   # defaults to TO if None
+SMTP_HOST = os.environ.get("TRADER_SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("TRADER_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("TRADER_SMTP_USER")                 # optional
+SMTP_PASS = os.environ.get("TRADER_SMTP_PASS")                 # optional
 
 
 # ================
@@ -148,6 +163,36 @@ def minutes_until_next_rth_open() -> float:
 
     delta = target_dt - now
     return max(delta.total_seconds() / 60.0, 0.0)
+
+
+def send_fatal_error_email(subject: str, body: str) -> None:
+    """
+    Send a single fatal-error email; no-op if email is not configured.
+
+    Summary: Uses SMTP + TLS to push a plain-text alert with traceback on crash.
+    """
+    if not ALERT_EMAIL_TO:
+        logger.error("[ALERT] ALERT_EMAIL_TO not set; skipping fatal error email.")
+        return
+
+    from_addr = ALERT_EMAIL_FROM or ALERT_EMAIL_TO
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = ALERT_EMAIL_TO
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            # Standard TLS handshake for port 587
+            server.starttls()
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+
+        logger.info(f"[ALERT] Sent fatal error email to {ALERT_EMAIL_TO}.")
+    except Exception as e:
+        logger.error(f"[ALERT-ERROR] Failed to send fatal error email: {e}")
 
 
 @dataclass
@@ -598,7 +643,6 @@ class PaperTrader:
             avg_price=avg_price, size=size, action=action, raw_trade=trade
         )
 
-
     def _close_position(
         self,
         symbol: str,
@@ -965,9 +1009,38 @@ class PaperTrader:
 
 
 def main() -> None:
-    """Instantiate a PaperTrader and run the live loop."""
+    """
+    Instantiate a PaperTrader and run the live loop, with fatal-error email alert.
+
+    Summary: Catches unhandled exceptions, logs traceback, sends email, and re-raises.
+    """
     trader = PaperTrader()
-    trader.run()
+    try:
+        trader.run()
+    except KeyboardInterrupt:
+        # Manual stop: no email spam.
+        logger.info("KeyboardInterrupt received; shutting down gracefully.")
+    except Exception as e:
+        # Any other unhandled exception = fatal crash.
+        tb = traceback.format_exc()
+        logger.error(f"[FATAL] Unhandled exception in main: {e}")
+        logger.error(tb)
+
+        subject = f"[ALGO FATAL] paper_trade crashed: {type(e).__name__}"
+        body = (
+            "paper_trade.py encountered an unhandled exception and exited.\n\n"
+            f"Exception type: {type(e).__name__}\n"
+            f"Exception message: {e}\n\n"
+            f"Traceback:\n{tb}"
+        )
+
+        try:
+            send_fatal_error_email(subject, body)
+        except Exception as mail_err:
+            logger.error(f"[ALERT-ERROR] Failed to send fatal error email: {mail_err}")
+
+        # Re-raise so the process exits non-zero (so systemd/cron can detect failure).
+        raise
 
 
 if __name__ == "__main__":
