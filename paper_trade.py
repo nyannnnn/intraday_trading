@@ -494,18 +494,20 @@ class PaperTrader:
         else:
             raise RuntimeError("Could not connect to IBKR after multiple attempts.")
 
-        self._log("Fetching IBKR NetLiquidation for starting equity...")
+                # We may still log IBKR NetLiquidation for monitoring, but we do NOT use it for sizing.
+        self._log(
+            f"Using internal STARTING_EQUITY={self.start_of_day_equity:.2f} "
+            f"for position sizing (ignoring IBKR NetLiquidation)."
+        )
+
         net_liq = self._ib_net_liquidation()
         if net_liq is not None:
-            self.start_of_day_equity = net_liq
             self._log(
-                f"Start-of-day equity from IBKR NetLiquidation: {net_liq:.2f}"
+                f"[INFO] IBKR NetLiquidation={net_liq:.2f} (for monitoring only; "
+                f"sizing still uses STARTING_EQUITY/internal PnL)."
             )
         else:
-            self._log(
-                f"Could not fetch NetLiquidation; using default "
-                f"STARTING_EQUITY={STARTING_EQUITY:.2f}"
-            )
+            self._log("[INFO] Could not fetch IBKR NetLiquidation.")
 
         self._log("Loading latest classifier...")
         self.clf = load_latest_classifier(MODEL_DIR)
@@ -700,13 +702,20 @@ class PaperTrader:
         if today != self.current_trading_date:
             # Log summary for previous day
             self._log_daily_summary()
-            # Reset for new day
+
+            # Update start_of_day_equity based on prior internal equity
+            prev_equity = self._current_equity()
+            self.start_of_day_equity = prev_equity
+            self._log(
+                f"[ROLL] New trading day {today}; setting start_of_day_equity="
+                f"{self.start_of_day_equity:.2f} based on prior internal equity."
+            )
+
+            # Reset daily PnL/trades for the new day
             self.current_trading_date = today
             self.realized_pnl_today = 0.0
             self.trades_today = []
-            eq = self._ib_net_liquidation()
-            if eq is not None:
-                self.start_of_day_equity = eq
+
 
     def _log_daily_summary(self) -> None:
         """Log summary of today's trades and performance."""
