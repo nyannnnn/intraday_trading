@@ -374,9 +374,13 @@ class PaperTrader:
             # Convert to DF (Only need last N bars for features)
             df = self._process_data_to_df(bars[-MAX_BUFFER_LENGTH:])
             if df.empty: continue
+
+            # --- LOGGING: Raw Data ---
+            last_ts = df.index[-1]
+            last_close = df['close'].iloc[-1]
+            self._log(f"[DATA] {symbol}: Time={last_ts} Close={last_close:.2f}")
             
             # Check if Data is Fresh (within last 10 mins)
-            last_ts = df.index[-1]
             now_utc = pd.Timestamp.utcnow()
             if (now_utc - last_ts).seconds > (BAR_INTERVAL_MIN * 60 * 2):
                 # Data is stale (market closed or lag), skip
@@ -404,16 +408,22 @@ class PaperTrader:
                 X = current_row[FEATURE_COLUMNS].values.reshape(1, -1)
                 p_up = self.clf.predict_proba(X)[0][1]
                 atr = calculate_atr(df, ATR_WINDOW)
+                current_price = df['close'].iloc[-1]
                 
                 # Default safety for threshold
                 thresh = P_UP_ENTRY_THRESHOLD if P_UP_ENTRY_THRESHOLD > 0 else 0.55
 
-                # Log signal periodically (e.g. if high enough to be interesting)
-                if p_up > 0.5:
-                     self._log(f"[SIGNAL] {symbol}: p={p_up:.3f} (Req: {thresh}) ATR={atr:.2f}")
+                # Calculate Potential TP/SL for Logging
+                pot_tp = current_price + (atr * ATR_TP_MULT)
+                pot_sl = current_price - (atr * ATR_STOP_MULT)
+
+                # --- LOGGING: Decision Metrics ---
+                self._log(
+                    f"[METRICS] {symbol}: p_up={p_up:.3f} (Thresh={thresh}) "
+                    f"ATR={atr:.2f} Pot_TP={pot_tp:.2f} Pot_SL={pot_sl:.2f}"
+                )
 
                 if p_up >= thresh and atr > 0:
-                    current_price = df['close'].iloc[-1]
                     
                     # Size Logic
                     risk_amt = STARTING_EQUITY * RISK_PER_TRADE_FRACTION
