@@ -402,7 +402,8 @@ class PaperTrader:
 
     def _load_existing_ib_positions(self) -> None:
         """
-        Seed positions from IBKR portfolio and link existing Bracket Orders (SL/TP).
+        Seed positions from IBKR portfolio.
+        If a position has no existing brackets (is naked), automatically attach 'Rescue' orders.
         """
         if self.ib is None or not self.ib.isConnected():
             return
@@ -411,9 +412,8 @@ class PaperTrader:
             # 1. Get actual held positions
             ib_positions = self.ib.positions()
             
-            # 2. Refresh and get Open Trades (contains Order + Contract info)
+            # 2. Get Open Trades to find attached SL/TP
             self.ib.reqAllOpenOrders()
-            # We use openTrades() because it reliably links the Contract to the Order
             open_trades = self.ib.openTrades()
             
             for p in ib_positions:
@@ -425,40 +425,59 @@ class PaperTrader:
                 if pos_size == 0:
                     continue
 
-                # Default values (assumed unmanaged)
+                avg_cost = float(p.avgCost or 0.0)
                 stop_price = 0.0
                 tp_price = 0.0
                 
-                # Scan for existing Sell orders for this symbol
-                # FIX: Iterate over 'Trade' objects, access 't.order.action'
+                # --- Scan for existing orders ---
                 relevant_trades = [
                     t for t in open_trades 
                     if t.contract.symbol == sym and t.order.action == 'SELL'
                 ]
 
-                # Heuristic to identify SL vs TP
-                avg_cost = float(p.avgCost or 0.0)
-                
                 for t in relevant_trades:
                     order = t.order
-                    # Check for Stop Loss
                     if order.orderType in ['STP', 'TRAIL']:
                         stop_price = order.auxPrice
-                    
-                    # Check for Limit (Take Profit) - assume Limit SELL above cost is TP
                     elif order.orderType == 'LMT':
+                        # Assume Limit Sell above cost is TP
                         if order.lmtPrice > avg_cost:
                             tp_price = order.lmtPrice
 
+                # --- RESCUE LOGIC: If Naked, Protect It ---
+                if stop_price == 0 and tp_price == 0:
+                    self._log(f"[RESCUE] {sym} is NAKED. Attaching new Hard Bracket...")
+                    
+                    # Calculate new levels based on Average Cost
+                    new_sl = round(avg_cost * (1.0 - STOP_LOSS_PCT), 2)
+                    new_tp = round(avg_cost * (1.0 + TAKE_PROFIT_PCT), 2)
+                    
+                    # Define Orders
+                    # We use OCA (One Cancels All) to link them without a parent order
+                    oca_group_name = f"RESCUE_{sym}_{int(time.time())}"
+                    
+                    sl_order = StopOrder('SELL', pos_size, new_sl)
+                    sl_order.ocaGroup = oca_group_name
+                    sl_order.ocaType = 1 # 1 = Cancel all remaining orders with block
+                    
+                    tp_order = LimitOrder('SELL', pos_size, new_tp)
+                    tp_order.ocaGroup = oca_group_name
+                    tp_order.ocaType = 1
+
+                    # Place them
+                    self.ib.placeOrder(p.contract, sl_order)
+                    self.ib.placeOrder(p.contract, tp_order)
+                    
+                    stop_price = new_sl
+                    tp_price = new_tp
+                    self._log(f"[RESCUE-SENT] {sym}: SL={new_sl}, TP={new_tp}")
+
+                # --- Log Status ---
                 log_msg = f"[EXISTING] {sym} size={pos_size} @ {avg_cost:.2f}."
                 if stop_price > 0:
-                    log_msg += f" Found SL={stop_price:.2f}."
+                    log_msg += f" SL={stop_price:.2f}"
                 if tp_price > 0:
-                    log_msg += f" Found TP={tp_price:.2f}."
-                
-                if stop_price == 0 and tp_price == 0:
-                    log_msg += " No active SL/TP orders found."
-
+                    log_msg += f" TP={tp_price:.2f}"
                 self._log(log_msg)
 
                 # Reconstruct Position object
@@ -466,15 +485,14 @@ class PaperTrader:
                     symbol=sym,
                     size=pos_size,
                     entry_price=avg_cost,
-                    entry_dt=self._ib_now(), # We don't know real entry time, reset to now
+                    entry_dt=self._ib_now(), 
                     stop_price=stop_price,
                     take_profit_price=tp_price,
-                    p_up=0.0 # Unknown entry signal
+                    p_up=0.0 
                 )
 
         except Exception as e:
-            self._log(f"[IB] Failed to load existing positions: {e}")
-            # print stack trace to logs for debugging if needed
+            self._log(f"[IB] Failed to load/rescue positions: {e}")
             logger.error(traceback.format_exc())
 
     def _submit_market_order(self, symbol: str, size: int) -> Optional[SimpleNamespace]:
