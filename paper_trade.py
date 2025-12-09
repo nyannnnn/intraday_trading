@@ -411,8 +411,10 @@ class PaperTrader:
             # 1. Get actual held positions
             ib_positions = self.ib.positions()
             
-            # 2. Get all open orders to find attached SL/TP
-            open_orders = self.ib.reqAllOpenOrders()
+            # 2. Refresh and get Open Trades (contains Order + Contract info)
+            self.ib.reqAllOpenOrders()
+            # We use openTrades() because it reliably links the Contract to the Order
+            open_trades = self.ib.openTrades()
             
             for p in ib_positions:
                 sym = p.contract.symbol
@@ -428,24 +430,25 @@ class PaperTrader:
                 tp_price = 0.0
                 
                 # Scan for existing Sell orders for this symbol
-                # We assume Long positions, so exits are SELL orders
-                relevant_orders = [
-                    o for o in open_orders 
-                    if o.contract.symbol == sym and o.action == 'SELL'
+                # FIX: Iterate over 'Trade' objects, access 't.order.action'
+                relevant_trades = [
+                    t for t in open_trades 
+                    if t.contract.symbol == sym and t.order.action == 'SELL'
                 ]
 
                 # Heuristic to identify SL vs TP
                 avg_cost = float(p.avgCost or 0.0)
                 
-                for o in relevant_orders:
+                for t in relevant_trades:
+                    order = t.order
                     # Check for Stop Loss
-                    if o.orderType in ['STP', 'TRAIL']:
-                        stop_price = o.auxPrice
+                    if order.orderType in ['STP', 'TRAIL']:
+                        stop_price = order.auxPrice
                     
                     # Check for Limit (Take Profit) - assume Limit SELL above cost is TP
-                    elif o.orderType == 'LMT':
-                        if o.lmtPrice > avg_cost:
-                            tp_price = o.lmtPrice
+                    elif order.orderType == 'LMT':
+                        if order.lmtPrice > avg_cost:
+                            tp_price = order.lmtPrice
 
                 log_msg = f"[EXISTING] {sym} size={pos_size} @ {avg_cost:.2f}."
                 if stop_price > 0:
@@ -471,6 +474,8 @@ class PaperTrader:
 
         except Exception as e:
             self._log(f"[IB] Failed to load existing positions: {e}")
+            # print stack trace to logs for debugging if needed
+            logger.error(traceback.format_exc())
 
     def _submit_market_order(self, symbol: str, size: int) -> Optional[SimpleNamespace]:
         # Used for closing only
