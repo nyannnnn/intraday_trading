@@ -27,15 +27,12 @@ LABEL_UP_THRESHOLD = 0.006      # +0.6% threshold for "up" label
 
 P_UP_ENTRY_THRESHOLD = 0.00      # ML probability threshold to enter long
 MAX_CONCURRENT_POSITIONS = 3    # max open trades at once
+RISK_PER_TRADE_FRACTION = 0.015   # 1.5% of total capital risked per trade
 STOP_LOSS_PCT = 0.02             # 2% down
 TAKE_PROFIT_PCT = 0.05           # 5% up
 MAX_BARS_IN_TRADE = 15           
 DAILY_LOSS_STOP_FRACTION = 0.03 # 3% daily loss stop
 COOLDOWN_BARS_AFTER_STOP = 6
-ATR_WINDOW = 20           # Lookback for volatility
-ATR_STOP_MULT = 2.0       # Stop Loss = 2x ATR
-ATR_TP_MULT = 3.0         # Take Profit = 3x ATR (1.5 R-Multiple)
-RISK_PER_TRADE_FRACTION = 0.005
 
 # Flat per-order fee (e.g. 1.50 per transaction)
 FEE_PER_ORDER = 1.50
