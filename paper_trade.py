@@ -188,7 +188,7 @@ class PaperTrader:
     # --- Connection & Setup ---
     
     def connect(self):
-        """Connects to IB and sets up data subscriptions."""
+        """Connects to IB, sets up data subscriptions, and waits for history."""
         self._log("Connecting to IB Gateway...")
         try:
             # Use a random client ID to avoid conflicts
@@ -205,14 +205,13 @@ class PaperTrader:
         except Exception as e:
             self._log(f"[WARN] Model load failed: {e}. Ensure models exist.")
 
-        # Setup Data Subscriptions (The Speed Fix)
+        # --- SUBSCRIPTION PHASE ---
         self._log(f"Subscribing to {len(UNIVERSE)} symbols...")
         for sym in UNIVERSE:
             contract = Stock(sym, 'SMART', 'USD')
             self.contracts[sym] = contract
             
-            # This is the magic line: keepUpToDate=True
-            # It backfills automatically and then appends new bars as they arrive.
+            # This request fetches 2 days of history AND keeps appending new bars
             bars = self.ib.reqHistoricalData(
                 contract, endDateTime='', durationStr='2 D',
                 barSizeSetting=f'{BAR_INTERVAL_MIN} mins',
@@ -220,7 +219,29 @@ class PaperTrader:
                 formatDate=1, keepUpToDate=True
             )
             self.live_bars[sym] = bars
-            self.ib.sleep(0.2) # Slight delay to be nice to the API
+        
+        # --- WARMUP WAIT PHASE ---
+        self._log("Waiting for historical data to download...")
+        start_wait = time.time()
+        
+        while True:
+            # Check how many symbols have enough bars
+            loaded_count = 0
+            for sym, bars in self.live_bars.items():
+                if len(bars) >= MIN_BARS_REQUIRED:
+                    loaded_count += 1
+            
+            # If all are ready, break
+            if loaded_count == len(UNIVERSE):
+                self._log(f"History loaded for all {len(UNIVERSE)} symbols.")
+                break
+            
+            # Timeout check (e.g., 45 seconds)
+            if time.time() - start_wait > 45:
+                self._log(f"[WARN] Timeout waiting for history. Proceeding with {loaded_count}/{len(UNIVERSE)} ready.")
+                break
+                
+            self.ib.sleep(1) # Allow background thread to process messages
 
         self._log("Data subscriptions active.")
         self._sync_positions()
@@ -270,16 +291,8 @@ class PaperTrader:
         stop_loss.transmit = True # Sending this triggers the whole group
         
         # Place Parent first to establish the group (IB insync handles wrapping)
-        # We use ib.placeOrder which returns a Trade object
-        
-        # IMPORTANT: IBKR Bracket Logic
-        # We explicitly set parentId on children to link them.
-        
         try:
             parent_trade = self.ib.placeOrder(contract, parent)
-            
-            # We need to wait a split second for the parent order to get an ID?
-            # ib_insync usually assigns a temporary ID immediately.
             
             take_profit.parentId = parent.orderId
             stop_loss.parentId = parent.orderId
@@ -339,7 +352,7 @@ class PaperTrader:
     def _run_cycle(self):
         """Single iteration of the logic."""
         
-        # 1. Update Portfolio Stats (FIXED: Filter manually instead of passing tags)
+        # 1. Update Portfolio Stats (Robust Method)
         try:
             current_eq = STARTING_EQUITY
             summaries = self.ib.accountSummary()
@@ -360,9 +373,6 @@ class PaperTrader:
             
             # Convert to DF (Only need last N bars for features)
             df = self._process_data_to_df(bars[-MAX_BUFFER_LENGTH:])
-            last_close = df['close'].iloc[-1]
-            last_time = df.index[-1]
-            print(f"[{symbol}] Time: {last_time} Price: {last_close}")
             if df.empty: continue
             
             # Check if Data is Fresh (within last 10 mins)
