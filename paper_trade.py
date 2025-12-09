@@ -10,6 +10,7 @@ from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
 import logging
 import os
 import csv
+import random
 import time
 import json
 import smtplib
@@ -291,7 +292,7 @@ class PaperTrader:
 
             # --- Process Data ---
             if bars:
-                data = [{"datetime": b.date.tz_localize("UTC"), "open": b.open, "high": b.high, 
+                data = [{"datetime": pd.Timestamp(b.date).tz_localize("UTC"), "open": b.open, "high": b.high, 
                          "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
                 df = pd.DataFrame(data).set_index("datetime").sort_index()
                 
@@ -309,7 +310,9 @@ class PaperTrader:
         self._log("Connecting to IBKR...")
         self.ib = IB()
         try:
-            self.ib.connect("127.0.0.1", 7497, clientId=1)
+            rand_id = random.randint(1, 999)
+            self.ib.connect("127.0.0.1", 7497, clientId=rand_id)
+            self._log(f"Connected with Client ID: {rand_id}")        
         except Exception as e:
             raise RuntimeError(f"IBKR Connection failed: {e}")
 
