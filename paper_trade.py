@@ -248,42 +248,54 @@ class PaperTrader:
         return buf.iloc[-1]
 
     def _backfill_buffers_on_startup(self) -> None:
-        """Backfill OHLCV buffers with patience (sleeps) to avoid IBKR pacing errors."""
+        """
+        Backfill OHLCV buffers with a fallback strategy.
+        Attempt 1: 2 Days, Outside RTH (Preferred).
+        Attempt 2: 1 Day, Inside RTH (Lighter request if servers are slow).
+        """
         if self.ib is None or not self.ib.isConnected(): return
         
-        self._log(f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} history (slow mode)...")
+        self._log(f"[BACKFILL] Starting backfill sequence...")
         
         for sym in UNIVERSE:
+            contract = self.contracts[sym]
+            bars = None
+            
+            # --- Attempt 1: Ideal Data (2 Days, Ext Hours) ---
             try:
-                # 1. Sleep to respect IBKR pacing (approx 60 reqs / 10 mins)
-                self.ib.sleep(2.0) 
-                
-                # 2. Request with timeout and useRTH=False for robustness
+                self.ib.sleep(2.0) # Throttle
                 bars = self.ib.reqHistoricalData(
-                    self.contracts[sym], 
-                    "", 
-                    BACKFILL_DURATION_STR, 
-                    f"{BAR_INTERVAL_MIN} mins", 
-                    "TRADES", 
-                    useRTH=False, 
-                    formatDate=1, 
-                    keepUpToDate=False,
-                    timeout=30 # Allow more time for server response
+                    contract, "", "2 D", f"{BAR_INTERVAL_MIN} mins", "TRADES", 
+                    useRTH=False, formatDate=1, keepUpToDate=False, timeout=45
                 )
-                
-                if bars:
-                    data = [{"datetime": b.date.tz_localize("UTC"), "open": b.open, "high": b.high, 
-                             "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
-                    df = pd.DataFrame(data).set_index("datetime").sort_index()
-                    if len(df) > MAX_BUFFER_LENGTH: df = df.iloc[-MAX_BUFFER_LENGTH:]
-                    self.ohlcv_buffers[sym] = df
-                    self._log(f"[BACKFILL] {sym}: Loaded {len(df)} bars.")
-                else:
-                    self._log(f"[BACKFILL] {sym}: No data returned.")
+            except Exception:
+                pass # Fail silently and try fallback
 
-            except Exception as e:
-                self._log(f"[BACKFILL-WARN] Failed to load {sym}: {e}")
-                continue
+            # --- Attempt 2: Fallback (1 Day, RTH Only) ---
+            if not bars:
+                self._log(f"[BACKFILL-RETRY] {sym}: Timed out. Retrying lighter request (1 D, RTH)...")
+                try:
+                    self.ib.sleep(2.0)
+                    bars = self.ib.reqHistoricalData(
+                        contract, "", "1 D", f"{BAR_INTERVAL_MIN} mins", "TRADES", 
+                        useRTH=True, formatDate=1, keepUpToDate=False, timeout=45
+                    )
+                except Exception as e:
+                    self._log(f"[BACKFILL-FAIL] {sym}: Could not load history. Starting empty. ({e})")
+                    continue
+
+            # --- Process Data ---
+            if bars:
+                data = [{"datetime": b.date.tz_localize("UTC"), "open": b.open, "high": b.high, 
+                         "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
+                df = pd.DataFrame(data).set_index("datetime").sort_index()
+                
+                # Deduplicate and sort
+                df = df[~df.index.duplicated(keep='last')].sort_index()
+                
+                if len(df) > MAX_BUFFER_LENGTH: df = df.iloc[-MAX_BUFFER_LENGTH:]
+                self.ohlcv_buffers[sym] = df
+                self._log(f"[BACKFILL] {sym}: Loaded {len(df)} bars.")
         
         self._sync_positions_with_ib()
 
