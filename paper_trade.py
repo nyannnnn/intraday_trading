@@ -95,7 +95,7 @@ heartbeat_logger.addHandler(RotatingFileHandler(os.path.join(LOG_DIR, "paper_tra
 STARTING_EQUITY = 100000.0
 MIN_BARS_FOR_FEATURES = 12
 MAX_BUFFER_LENGTH = 500
-BACKFILL_DURATION_STR = "5 D"
+BACKFILL_DURATION_STR = "2 D"
 
 ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
 ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
