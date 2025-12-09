@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from ib_insync import IB, MarketOrder, Stock
+from ib_insync import IB, MarketOrder, Stock, LimitOrder, StopOrder
 
 # === Config Imports ===
 try:
@@ -71,23 +71,20 @@ TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
 logger = logging.getLogger("paper_trade")
 logger.setLevel(logging.INFO)
 
-# FIX: Only add handlers if they don't exist yet to prevent double logging
+# Only add handlers if they don't exist yet to prevent double logging
 if not logger.handlers:
-    # File handler
     file_handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=5)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     )
     logger.addHandler(file_handler)
 
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     )
     logger.addHandler(console_handler)
 
-# Separate heartbeat logger
 heartbeat_logger = logging.getLogger("paper_trade_heartbeat")
 heartbeat_logger.setLevel(logging.INFO)
 if not heartbeat_logger.handlers:
@@ -404,23 +401,79 @@ class PaperTrader:
         self._connect_ib_and_setup()
 
     def _load_existing_ib_positions(self) -> None:
-        if self.ib is None or not self.ib.isConnected(): return
+        """
+        Seed positions from IBKR portfolio and link existing Bracket Orders (SL/TP).
+        """
+        if self.ib is None or not self.ib.isConnected():
+            return
+
         try:
-            port = self.ib.positions()
-            for p in port:
+            # 1. Get actual held positions
+            ib_positions = self.ib.positions()
+            
+            # 2. Get all open orders to find attached SL/TP
+            open_orders = self.ib.reqAllOpenOrders()
+            
+            for p in ib_positions:
                 sym = p.contract.symbol
-                if sym not in UNIVERSE: continue
+                if sym not in UNIVERSE:
+                    continue
+                
                 pos_size = int(p.position)
-                if pos_size == 0: continue
-                self._log(f"[EXISTING] {sym} size={pos_size}. Tracking without SL/TP.")
+                if pos_size == 0:
+                    continue
+
+                # Default values (assumed unmanaged)
+                stop_price = 0.0
+                tp_price = 0.0
+                
+                # Scan for existing Sell orders for this symbol
+                # We assume Long positions, so exits are SELL orders
+                relevant_orders = [
+                    o for o in open_orders 
+                    if o.contract.symbol == sym and o.action == 'SELL'
+                ]
+
+                # Heuristic to identify SL vs TP
+                avg_cost = float(p.avgCost or 0.0)
+                
+                for o in relevant_orders:
+                    # Check for Stop Loss
+                    if o.orderType in ['STP', 'TRAIL']:
+                        stop_price = o.auxPrice
+                    
+                    # Check for Limit (Take Profit) - assume Limit SELL above cost is TP
+                    elif o.orderType == 'LMT':
+                        if o.lmtPrice > avg_cost:
+                            tp_price = o.lmtPrice
+
+                log_msg = f"[EXISTING] {sym} size={pos_size} @ {avg_cost:.2f}."
+                if stop_price > 0:
+                    log_msg += f" Found SL={stop_price:.2f}."
+                if tp_price > 0:
+                    log_msg += f" Found TP={tp_price:.2f}."
+                
+                if stop_price == 0 and tp_price == 0:
+                    log_msg += " No active SL/TP orders found."
+
+                self._log(log_msg)
+
+                # Reconstruct Position object
                 self.positions[sym] = Position(
-                    symbol=sym, size=pos_size, entry_price=float(p.avgCost or 0.0),
-                    entry_dt=self._ib_now(), stop_price=0.0, take_profit_price=0.0, p_up=0.0
+                    symbol=sym,
+                    size=pos_size,
+                    entry_price=avg_cost,
+                    entry_dt=self._ib_now(), # We don't know real entry time, reset to now
+                    stop_price=stop_price,
+                    take_profit_price=tp_price,
+                    p_up=0.0 # Unknown entry signal
                 )
+
         except Exception as e:
             self._log(f"[IB] Failed to load existing positions: {e}")
 
     def _submit_market_order(self, symbol: str, size: int) -> Optional[SimpleNamespace]:
+        # Used for closing only
         contract = self.contracts[symbol]
         action = "BUY" if size > 0 else "SELL"
         self._log(f"[ORDER] Submitting {action} {abs(size)} {symbol} (MKT)...")
@@ -441,17 +494,86 @@ class PaperTrader:
         self._log(f"[ORDER-FILLED] {action} {abs(size)} {symbol} avg={avg_price:.4f}")
         return SimpleNamespace(avg_price=avg_price, size=size, action=action, raw_trade=trade)
 
+    def _place_bracket_order(self, symbol: str, size: int, p_up: float, current_price: float, bar_time: pd.Timestamp):
+        """
+        Submit a real Bracket Order (Parent Market + Child Limit + Child Stop).
+        """
+        contract = self.contracts[symbol]
+        
+        # Calculate prices
+        stop_price = round(current_price * (1.0 - STOP_LOSS_PCT), 2)
+        tp_price = round(current_price * (1.0 + TAKE_PROFIT_PCT), 2)
+
+        # 1. Parent Order (Market Buy)
+        parent = MarketOrder('BUY', size)
+        parent.transmit = False # Important: Don't send yet
+        
+        # 2. Take Profit (Limit Sell)
+        takeProfit = LimitOrder('SELL', size, tp_price)
+        takeProfit.transmit = False
+        
+        # 3. Stop Loss (Stop Sell)
+        stopLoss = StopOrder('SELL', size, stop_price)
+        stopLoss.transmit = True # Sending this triggers the group
+
+        # Place orders (ib_insync handles the grouping if we link them or use list)
+        # Note: In newer ib_insync, we can use the bracket list approach,
+        # but manual linking is safest for correct OCO behavior.
+        
+        # We place parent first to get an ID? No, ib_insync assigns IDs.
+        # We just need to link them via parentId
+        
+        orders = [parent, takeProfit, stopLoss]
+        trades = []
+        for o in orders:
+            # We must qualify to get IDs? No, placeOrder does it.
+            # But children need parentId.
+            # Standard approach:
+            pass
+
+        # Cleaner approach with ib_insync built-in linkage
+        parent.orderId = self.ib.client.getReqId()
+        takeProfit.parentId = parent.orderId
+        stopLoss.parentId = parent.orderId
+        
+        # Place them
+        parent_trade = self.ib.placeOrder(contract, parent)
+        tp_trade = self.ib.placeOrder(contract, takeProfit)
+        sl_trade = self.ib.placeOrder(contract, stopLoss)
+        
+        # Wait a moment for local confirmation (optional)
+        self.ib.sleep(0.5)
+
+        # Assuming fill is immediate for Market, but we record the intent
+        entry_price = current_price # Approximation until fill
+
+        self.positions[symbol] = Position(
+            symbol=symbol, size=size, entry_price=entry_price, entry_dt=bar_time,
+            stop_price=stop_price, take_profit_price=tp_price, p_up=p_up
+        )
+        self._log(f"[ENTRY-BRACKET] {symbol} sent. Size={size} EstPrice={current_price:.2f} SL={stop_price} TP={tp_price}")
+
     def _close_position(self, symbol: str, pos: Position, exit_price: float, exit_ts: pd.Timestamp, reason: str) -> None:
+        # Cancel any open orders for this symbol first (Clean up the bracket children)
+        open_orders = self.ib.openOrders()
+        for o in open_orders:
+            if o.contract.symbol == symbol:
+                self.ib.cancelOrder(o)
+        
+        # Now close the position
         size = pos.size
         fills = self._submit_market_order(symbol, -size)
+        
         if fills is None:
             self._log(f"[EXIT-FAILED] {symbol}: no fills on close.")
             return
+            
         realized = (fills.avg_price - pos.entry_price) * size
         r_multiple = realized / (STOP_LOSS_PCT * pos.entry_price * size)
         self.realized_pnl_today += realized
         if reason == "STOP":
             self.last_stop_bar[symbol] = exit_ts
+            
         trade_record = {
             "symbol": symbol, "entry_dt": pos.entry_dt, "exit_dt": exit_ts,
             "entry_price": pos.entry_price, "exit_price": fills.avg_price,
@@ -500,28 +622,30 @@ class PaperTrader:
             if not bars: continue
             last = self._update_buffer_from_bars(sym, bars)
             if last is None: continue
-            self._log(f"[BAR] {sym}: close={float(last['close']):.4f}")
+            # self._log(f"[BAR] {sym}: close={float(last['close']):.4f}") # Too noisy
 
-        # 2. Check Exits
+        # 2. Check Exits (Wait, if we use Brackets, IBKR exits for us.
+        # BUT we still monitor here to log the exit if it happens externally)
         for sym, pos in list(self.positions.items()):
+            # Check if position is gone in IBKR (hit bracket)
+            ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
+            if sym not in ib_positions or ib_positions[sym] == 0:
+                self._log(f"[EXIT-DETECTED] {sym} no longer in portfolio (Bracket hit?).")
+                # We don't know exact exit price here easily without execution details
+                # Just assuming close price for logging approximate PnL
+                buf = self.ohlcv_buffers.get(sym)
+                close = buf.iloc[-1]['close'] if buf is not None else pos.entry_price
+                self._close_position(sym, pos, close, now_ts, "BRACKET_HIT")
+                continue
+            
+            # Time Stop (We still need to enforce this manually)
             buf = self.ohlcv_buffers.get(sym)
             if buf is None or buf.empty: continue
             last_ts = buf.index[-1]
-            last_row = buf.iloc[-1]
-            close, high, low = float(last_row["close"]), float(last_row["high"]), float(last_row["low"])
-
-            if low <= pos.stop_price:
-                self._log(f"[EXIT-CHECK] {sym}: STOP hit.")
-                self._close_position(sym, pos, pos.stop_price, last_ts, "STOP")
-                continue
-            if high >= pos.take_profit_price:
-                self._log(f"[EXIT-CHECK] {sym}: TP hit.")
-                self._close_position(sym, pos, pos.take_profit_price, last_ts, "TP")
-                continue
             bars_held = (last_ts - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
             if bars_held >= MAX_BARS_IN_TRADE:
                 self._log(f"[EXIT-CHECK] {sym}: MAX_BARS hit.")
-                self._close_position(sym, pos, close, last_ts, "MAX_BARS")
+                self._close_position(sym, pos, buf.iloc[-1]['close'], last_ts, "MAX_BARS")
 
         # 3. Check Entries
         if self._max_daily_loss_reached(): return
@@ -542,7 +666,10 @@ class PaperTrader:
 
             x = feat_vals.to_frame().T
             p_up = float(self.clf.predict_proba(x)[0, 1])
-            self._log(f"[SIGNAL] {sym}: p_up={p_up:.3f}")
+
+            # Filter noise from log
+            if p_up > 0.5:
+                self._log(f"[SIGNAL] {sym}: p_up={p_up:.3f}")
 
             if p_up < P_UP_ENTRY_THRESHOLD: continue
             if not self._position_risk_ok(sym, buf.index[-1]): continue
@@ -551,17 +678,8 @@ class PaperTrader:
             size = self._calc_position_size(price)
             if size <= 0: continue
 
-            fills = self._submit_market_order(sym, size)
-            if fills is None: continue
-
-            entry_price = fills.avg_price
-            stop_price = entry_price * (1.0 - STOP_LOSS_PCT)
-            tp_price = entry_price * (1.0 + TAKE_PROFIT_PCT)
-            self.positions[sym] = Position(
-                sym=sym, size=size, entry_price=entry_price, entry_dt=buf.index[-1],
-                stop_price=stop_price, take_profit_price=tp_price, p_up=p_up
-            )
-            self._log(f"[ENTRY] {sym} @ {entry_price:.2f}, p_up={p_up:.3f}")
+            # USE BRACKET ENTRY
+            self._place_bracket_order(sym, size, p_up, price, buf.index[-1])
 
     def _log_open_positions(self) -> None:
         if not self.positions:
