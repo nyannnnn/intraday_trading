@@ -456,21 +456,31 @@ class PaperTrader:
                     # We use OCA (One Cancels All) to link them without a parent order
                     oca_group_name = f"RESCUE_{sym}_{int(time.time())}"
                     
+                    # Explicitly set TIF to 'GTC' (Good Till Cancel) or 'DAY' to avoid preset errors
                     sl_order = StopOrder('SELL', pos_size, new_sl)
                     sl_order.ocaGroup = oca_group_name
-                    sl_order.ocaType = 1 # 1 = Cancel all remaining orders with block
+                    sl_order.ocaType = 1 
+                    sl_order.tif = 'DAY' 
                     
                     tp_order = LimitOrder('SELL', pos_size, new_tp)
                     tp_order.ocaGroup = oca_group_name
                     tp_order.ocaType = 1
+                    tp_order.tif = 'DAY'
 
-                    # Place them
-                    self.ib.placeOrder(p.contract, sl_order)
-                    self.ib.placeOrder(p.contract, tp_order)
+                    # CRITICAL FIX: Use self.contracts[sym] (SMART) instead of p.contract (NASDAQ)
+                    # This prevents "Direct Routing" errors.
+                    contract_smart = self.contracts.get(sym)
+                    if not contract_smart:
+                        # Fallback if somehow missing
+                        contract_smart = Stock(sym, 'SMART', 'USD')
+                        self.ib.qualifyContracts(contract_smart)
+
+                    self.ib.placeOrder(contract_smart, sl_order)
+                    self.ib.placeOrder(contract_smart, tp_order)
                     
                     stop_price = new_sl
                     tp_price = new_tp
-                    self._log(f"[RESCUE-SENT] {sym}: SL={new_sl}, TP={new_tp}")
+                    self._log(f"[RESCUE-SENT] {sym}: SL={new_sl}, TP={new_tp} (Sent to SMART)")
 
                 # --- Log Status ---
                 log_msg = f"[EXISTING] {sym} size={pos_size} @ {avg_cost:.2f}."
