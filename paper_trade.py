@@ -119,10 +119,12 @@ HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
 # === Helpers ===
 
 def is_rth_now() -> bool:
+    """Check if current time is within trading hours (approximate)."""
     now = dt.datetime.now(RTH_TZ) if RTH_TZ else dt.datetime.now()
     return RTH_START <= now.time() <= RTH_END
 
 def minutes_until_next_rth_open() -> float:
+    """Calculate minutes until next RTH open to optimize sleep cycles."""
     now = dt.datetime.now(RTH_TZ) if RTH_TZ else dt.datetime.now()
     if now.time() < RTH_START:
         target_date = now.date()
@@ -147,6 +149,7 @@ def send_fatal_error_email(subject: str, body: str) -> None:
         logger.error(f"[ALERT-ERROR] Failed to send email: {e}")
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Compute Average True Range (ATR) for volatility sizing."""
     if len(df) < period + 1: return 0.0
     high, low, close = df['high'], df['low'], df['close']
     prev_close = close.shift(1)
@@ -175,6 +178,7 @@ class PaperTrader:
         logger.info(msg)
 
     def _append_trade_to_csv(self, trade_record: dict) -> None:
+        """Log closed trades to CSV."""
         os.makedirs(LOG_DIR, exist_ok=True)
         file_exists = os.path.exists(TRADES_CSV_PATH)
         fieldnames = ["symbol", "entry_dt", "exit_dt", "entry_price", "exit_price", "size", "pnl", "r_multiple", "reason"]
@@ -199,6 +203,7 @@ class PaperTrader:
         return self.start_of_day_equity + self.realized_pnl_today
 
     def _calc_position_size(self, price: float, atr: float) -> int:
+        """Calculate position size using Volatility Sizing & Hard Caps."""
         if price <= 0 or atr <= 0: return 0
         equity = self._current_equity()
         risk_capital = RISK_PER_TRADE_FRACTION * equity
@@ -229,6 +234,7 @@ class PaperTrader:
     # --- Data & Connection ---
 
     def _update_buffer_from_bars(self, symbol: str, bars: list) -> Optional[pd.Series]:
+        """Append latest bar to buffer."""
         if not bars: return None
         last_bar = bars[-1]
         ts = last_bar.date.tz_localize("UTC") if last_bar.date.tzinfo is None else last_bar.date.tz_convert("UTC")
@@ -241,7 +247,48 @@ class PaperTrader:
         self.ohlcv_buffers[symbol] = buf
         return buf.iloc[-1]
 
+    def _backfill_buffers_on_startup(self) -> None:
+        """Backfill OHLCV buffers with patience (sleeps) to avoid IBKR pacing errors."""
+        if self.ib is None or not self.ib.isConnected(): return
+        
+        self._log(f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} history (slow mode)...")
+        
+        for sym in UNIVERSE:
+            try:
+                # 1. Sleep to respect IBKR pacing (approx 60 reqs / 10 mins)
+                self.ib.sleep(2.0) 
+                
+                # 2. Request with timeout and useRTH=False for robustness
+                bars = self.ib.reqHistoricalData(
+                    self.contracts[sym], 
+                    "", 
+                    BACKFILL_DURATION_STR, 
+                    f"{BAR_INTERVAL_MIN} mins", 
+                    "TRADES", 
+                    useRTH=False, 
+                    formatDate=1, 
+                    keepUpToDate=False,
+                    timeout=30 # Allow more time for server response
+                )
+                
+                if bars:
+                    data = [{"datetime": b.date.tz_localize("UTC"), "open": b.open, "high": b.high, 
+                             "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
+                    df = pd.DataFrame(data).set_index("datetime").sort_index()
+                    if len(df) > MAX_BUFFER_LENGTH: df = df.iloc[-MAX_BUFFER_LENGTH:]
+                    self.ohlcv_buffers[sym] = df
+                    self._log(f"[BACKFILL] {sym}: Loaded {len(df)} bars.")
+                else:
+                    self._log(f"[BACKFILL] {sym}: No data returned.")
+
+            except Exception as e:
+                self._log(f"[BACKFILL-WARN] Failed to load {sym}: {e}")
+                continue
+        
+        self._sync_positions_with_ib()
+
     def _connect_ib_and_setup(self) -> None:
+        """Initialize IBKR connection and load data."""
         self._log("Connecting to IBKR...")
         self.ib = IB()
         try:
@@ -255,24 +302,11 @@ class PaperTrader:
             self.contracts[sym] = Stock(sym, "SMART", "USD")
         self.ib.qualifyContracts(*self.contracts.values())
 
-        self._log(f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} history...")
-        for sym in UNIVERSE:
-            try:
-                # Use explicit useRTH=False for backfill to ensure we get recent data even if outside RTH
-                bars = self.ib.reqHistoricalData(self.contracts[sym], "", BACKFILL_DURATION_STR, 
-                                                 f"{BAR_INTERVAL_MIN} mins", "TRADES", 
-                                                 useRTH=False, formatDate=1, keepUpToDate=False)
-                if bars:
-                    data = [{"datetime": b.date.tz_localize("UTC"), "open": b.open, "high": b.high, 
-                             "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
-                    df = pd.DataFrame(data).set_index("datetime").sort_index()
-                    if len(df) > MAX_BUFFER_LENGTH: df = df.iloc[-MAX_BUFFER_LENGTH:]
-                    self.ohlcv_buffers[sym] = df
-            except Exception:
-                continue
-        self._sync_positions_with_ib()
+        # Perform Backfill
+        self._backfill_buffers_on_startup()
 
     def _sync_positions_with_ib(self):
+        """Reconcile local state with IBKR portfolio."""
         ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
         for sym in list(self.positions.keys()):
             if sym not in ib_positions or ib_positions[sym] == 0:
@@ -302,6 +336,7 @@ class PaperTrader:
     # --- Execution Logic ---
 
     def _submit_bracket_order(self, symbol: str, quantity: int, current_price: float, p_up: float, atr: float) -> None:
+        """Submit Entry + Stop Loss + Take Profit orders."""
         stop_dist = round(atr * ATR_STOP_MULT, 2)
         tp_dist = round(atr * ATR_TP_MULT, 2)
         stop_price = round(current_price - stop_dist, 2)
@@ -328,6 +363,7 @@ class PaperTrader:
         save_state_to_disk(self.positions)
 
     def _check_exit_signals(self, symbol: str, current_price: float) -> None:
+        """Check for Time-based exits (Price exits handled by IBKR)."""
         pos = self.positions.get(symbol)
         if not pos: return
 
@@ -347,6 +383,7 @@ class PaperTrader:
             self._cancel_bracket_and_close(symbol)
 
     def _cancel_bracket_and_close(self, symbol: str):
+        """Force close a position."""
         for order in self.ib.openOrders():
             if order.contract.symbol == symbol:
                 self.ib.cancelOrder(order)
@@ -389,6 +426,7 @@ class PaperTrader:
     # --- Main Loop ---
 
     def _poll_bars_once(self) -> None:
+        """Poll data -> Check Exits -> Generate Features -> Check Entries."""
         now_ts = self._ib_now()
         
         if self.current_trading_date != now_ts.date():
@@ -400,7 +438,7 @@ class PaperTrader:
         # 1. Data Ingestion
         for sym in UNIVERSE:
             try:
-                # useRTH=False to allow testing data flow anytime
+                # useRTH=False allows testing data flow anytime
                 bars = self.ib.reqHistoricalData(self.contracts[sym], "", f"{BAR_INTERVAL_MIN * 2} M", 
                                                  f"{BAR_INTERVAL_MIN} mins", "TRADES", 
                                                  useRTH=False, formatDate=1, keepUpToDate=False)
