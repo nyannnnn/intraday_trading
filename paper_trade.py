@@ -340,7 +340,11 @@ class PaperTrader:
         """Single iteration of the logic."""
         
         # 1. Update Portfolio Stats
-        current_eq = float(self.ib.accountSummary()[0].value) if self.ib.accountSummary() else STARTING_EQUITY
+        account_summaries = self.ib.accountSummary(tags='NetLiquidation')
+        if account_summaries:
+            current_eq = float(account_summaries[0].value)
+        else:
+            current_eq = STARTING_EQUITY
         # (Simplified equity check for speed)
         
         # 2. Iterate Universe
@@ -439,7 +443,6 @@ class PaperTrader:
                 if not self.ib.isConnected():
                     try: 
                         self.ib.connect('127.0.0.1', 7497, clientId=random.randint(100,999))
-                        self._re-subscribe() # You would implement re-subscribing logic here
                     except: pass
 
 if __name__ == "__main__":
