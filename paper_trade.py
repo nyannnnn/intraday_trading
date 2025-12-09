@@ -453,10 +453,9 @@ class PaperTrader:
                     new_tp = round(avg_cost * (1.0 + TAKE_PROFIT_PCT), 2)
                     
                     # Define Orders
-                    # We use OCA (One Cancels All) to link them without a parent order
                     oca_group_name = f"RESCUE_{sym}_{int(time.time())}"
                     
-                    # Explicitly set TIF to 'GTC' (Good Till Cancel) or 'DAY' to avoid preset errors
+                    # Explicitly set TIF to 'DAY' to avoid preset errors
                     sl_order = StopOrder('SELL', pos_size, new_sl)
                     sl_order.ocaGroup = oca_group_name
                     sl_order.ocaType = 1 
@@ -468,10 +467,8 @@ class PaperTrader:
                     tp_order.tif = 'DAY'
 
                     # CRITICAL FIX: Use self.contracts[sym] (SMART) instead of p.contract (NASDAQ)
-                    # This prevents "Direct Routing" errors.
                     contract_smart = self.contracts.get(sym)
                     if not contract_smart:
-                        # Fallback if somehow missing
                         contract_smart = Stock(sym, 'SMART', 'USD')
                         self.ib.qualifyContracts(contract_smart)
 
@@ -528,57 +525,29 @@ class PaperTrader:
         return SimpleNamespace(avg_price=avg_price, size=size, action=action, raw_trade=trade)
 
     def _place_bracket_order(self, symbol: str, size: int, p_up: float, current_price: float, bar_time: pd.Timestamp):
-        """
-        Submit a real Bracket Order (Parent Market + Child Limit + Child Stop).
-        """
         contract = self.contracts[symbol]
-        
-        # Calculate prices
         stop_price = round(current_price * (1.0 - STOP_LOSS_PCT), 2)
         tp_price = round(current_price * (1.0 + TAKE_PROFIT_PCT), 2)
 
-        # 1. Parent Order (Market Buy)
         parent = MarketOrder('BUY', size)
-        parent.transmit = False # Important: Don't send yet
+        parent.transmit = False 
         
-        # 2. Take Profit (Limit Sell)
         takeProfit = LimitOrder('SELL', size, tp_price)
         takeProfit.transmit = False
         
-        # 3. Stop Loss (Stop Sell)
         stopLoss = StopOrder('SELL', size, stop_price)
-        stopLoss.transmit = True # Sending this triggers the group
+        stopLoss.transmit = True 
 
-        # Place orders (ib_insync handles the grouping if we link them or use list)
-        # Note: In newer ib_insync, we can use the bracket list approach,
-        # but manual linking is safest for correct OCO behavior.
-        
-        # We place parent first to get an ID? No, ib_insync assigns IDs.
-        # We just need to link them via parentId
-        
-        orders = [parent, takeProfit, stopLoss]
-        trades = []
-        for o in orders:
-            # We must qualify to get IDs? No, placeOrder does it.
-            # But children need parentId.
-            # Standard approach:
-            pass
-
-        # Cleaner approach with ib_insync built-in linkage
         parent.orderId = self.ib.client.getReqId()
         takeProfit.parentId = parent.orderId
         stopLoss.parentId = parent.orderId
         
-        # Place them
-        parent_trade = self.ib.placeOrder(contract, parent)
-        tp_trade = self.ib.placeOrder(contract, takeProfit)
-        sl_trade = self.ib.placeOrder(contract, stopLoss)
+        self.ib.placeOrder(contract, parent)
+        self.ib.placeOrder(contract, takeProfit)
+        self.ib.placeOrder(contract, stopLoss)
         
-        # Wait a moment for local confirmation (optional)
         self.ib.sleep(0.5)
-
-        # Assuming fill is immediate for Market, but we record the intent
-        entry_price = current_price # Approximation until fill
+        entry_price = current_price 
 
         self.positions[symbol] = Position(
             symbol=symbol, size=size, entry_price=entry_price, entry_dt=bar_time,
@@ -591,13 +560,11 @@ class PaperTrader:
         Close a position, cancel any pending orders, and log the result.
         """
         # 1. Cancel any open orders for this symbol (Cleanup bracket children)
-        # FIX: Use openTrades() to access the contract associated with the order
         for t in self.ib.openTrades():
             if t.contract.symbol == symbol:
                 self.ib.cancelOrder(t.order)
         
         # 2. If the exit reason is NOT 'BRACKET_HIT', we need to send a market sell.
-        # If it WAS a bracket hit, the position is already gone at IBKR, so we skip the sell order.
         if reason != "BRACKET_HIT":
             size = pos.size
             fills = self._submit_market_order(symbol, -size)
@@ -606,8 +573,6 @@ class PaperTrader:
                 return
             realized_price = fills.avg_price
         else:
-            # If bracket hit, we use the estimated price passed in (usually close of bar)
-            # ideally we'd find the execution price, but for now this approximates it.
             realized_price = exit_price
 
         # 3. Calculate PnL
@@ -658,7 +623,10 @@ class PaperTrader:
 
         # 1. Fetch Bars
         for sym in UNIVERSE:
-            self.ib.sleep(0.5)
+            # === PACE LIMITER ===
+            # Sleep 0.5s between requests to avoid Error 162 (Pacing Violation)
+            self.ib.sleep(0.5) 
+            
             contract = self.contracts[sym]
             try:
                 bars = self.ib.reqHistoricalData(
@@ -671,7 +639,6 @@ class PaperTrader:
             if not bars: continue
             last = self._update_buffer_from_bars(sym, bars)
             if last is None: continue
-            # self._log(f"[BAR] {sym}: close={float(last['close']):.4f}") # Too noisy
 
         # 2. Check Exits (Wait, if we use Brackets, IBKR exits for us.
         # BUT we still monitor here to log the exit if it happens externally)
@@ -680,8 +647,6 @@ class PaperTrader:
             ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
             if sym not in ib_positions or ib_positions[sym] == 0:
                 self._log(f"[EXIT-DETECTED] {sym} no longer in portfolio (Bracket hit?).")
-                # We don't know exact exit price here easily without execution details
-                # Just assuming close price for logging approximate PnL
                 buf = self.ohlcv_buffers.get(sym)
                 close = buf.iloc[-1]['close'] if buf is not None else pos.entry_price
                 self._close_position(sym, pos, close, now_ts, "BRACKET_HIT")
