@@ -658,6 +658,7 @@ class PaperTrader:
 
         # 1. Fetch Bars
         for sym in UNIVERSE:
+            self.ib.sleep(0.5)
             contract = self.contracts[sym]
             try:
                 bars = self.ib.reqHistoricalData(
