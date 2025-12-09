@@ -322,6 +322,10 @@ class PaperTrader:
             return
         self._log(f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} of {BAR_INTERVAL_MIN}-min RTH bars...")
         for sym in UNIVERSE:
+            # === STARTUP PACE LIMITER ===
+            # Sleep 1.0s between requests to avoid Error 162
+            self.ib.sleep(1.0)
+            
             contract = self.contracts[sym]
             try:
                 bars = self.ib.reqHistoricalData(
@@ -624,8 +628,8 @@ class PaperTrader:
         # 1. Fetch Bars
         for sym in UNIVERSE:
             # === PACE LIMITER ===
-            # Sleep 0.5s between requests to avoid Error 162 (Pacing Violation)
-            self.ib.sleep(0.5) 
+            # Sleep 1.0s between requests to avoid Error 162 (Pacing Violation)
+            self.ib.sleep(1.0) 
             
             contract = self.contracts[sym]
             try:
