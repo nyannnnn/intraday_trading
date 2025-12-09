@@ -375,12 +375,8 @@ class PaperTrader:
             df = self._process_data_to_df(bars[-MAX_BUFFER_LENGTH:])
             if df.empty: continue
 
-            # --- LOGGING: Raw Data ---
-            last_ts = df.index[-1]
-            last_close = df['close'].iloc[-1]
-            self._log(f"[DATA] {symbol}: Time={last_ts} Close={last_close:.2f}")
-            
             # Check if Data is Fresh (within last 10 mins)
+            last_ts = df.index[-1]
             now_utc = pd.Timestamp.utcnow()
             if (now_utc - last_ts).seconds > (BAR_INTERVAL_MIN * 60 * 2):
                 # Data is stale (market closed or lag), skip
@@ -418,10 +414,12 @@ class PaperTrader:
                 pot_sl = current_price - (atr * ATR_STOP_MULT)
 
                 # --- LOGGING: Decision Metrics ---
-                self._log(
-                    f"[METRICS] {symbol}: p_up={p_up:.3f} (Thresh={thresh}) "
-                    f"ATR={atr:.2f} Pot_TP={pot_tp:.2f} Pot_SL={pot_sl:.2f}"
-                )
+                # Only log if p_up is > 0.5 to filter out noise, but keep it transparent for "interesting" bars
+                if p_up > 0.5:
+                    self._log(
+                        f"[METRICS] {symbol}: p_up={p_up:.3f} (Thresh={thresh}) "
+                        f"ATR={atr:.2f} Price={current_price:.2f} Pot_TP={pot_tp:.2f} Pot_SL={pot_sl:.2f}"
+                    )
 
                 if p_up >= thresh and atr > 0:
                     
