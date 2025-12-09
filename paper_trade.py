@@ -95,7 +95,7 @@ heartbeat_logger.addHandler(RotatingFileHandler(os.path.join(LOG_DIR, "paper_tra
 STARTING_EQUITY = 100000.0
 MIN_BARS_FOR_FEATURES = 12
 MAX_BUFFER_LENGTH = 500
-BACKFILL_DURATION_STR = "2 D"
+BACKFILL_DURATION_STR = "5 D"
 
 ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
 ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
@@ -202,6 +202,12 @@ class PaperTrader:
     def _current_equity(self) -> float:
         return self.start_of_day_equity + self.realized_pnl_today
 
+    def _max_daily_loss_reached(self) -> bool:
+        """Return True if daily loss exceeds configured fraction."""
+        equity_now = self._current_equity()
+        drop = (equity_now - self.start_of_day_equity) / self.start_of_day_equity
+        return drop <= -DAILY_LOSS_STOP_FRACTION
+
     def _calc_position_size(self, price: float, atr: float) -> int:
         """Calculate position size using Volatility Sizing & Hard Caps."""
         if price <= 0 or atr <= 0: return 0
@@ -225,8 +231,7 @@ class PaperTrader:
                 self._log(f"[ENTRY-SKIP] {symbol}: In cooldown ({bars_since:.1f} < {COOLDOWN_BARS_AFTER_STOP}).")
                 return False
                 
-        drop = (self._current_equity() - self.start_of_day_equity) / self.start_of_day_equity
-        if drop <= -DAILY_LOSS_STOP_FRACTION:
+        if self._max_daily_loss_reached():
             self._log(f"[ENTRY-SKIP] {symbol}: Daily loss limit hit.")
             return False
         return True
@@ -451,9 +456,10 @@ class PaperTrader:
         for sym in UNIVERSE:
             try:
                 # useRTH=False allows testing data flow anytime
+                # Added timeout=30 to prevent long hangs during maintenance
                 bars = self.ib.reqHistoricalData(self.contracts[sym], "", f"{BAR_INTERVAL_MIN * 2} M", 
                                                  f"{BAR_INTERVAL_MIN} mins", "TRADES", 
-                                                 useRTH=False, formatDate=1, keepUpToDate=False)
+                                                 useRTH=False, formatDate=1, keepUpToDate=False, timeout=30)
                 last = self._update_buffer_from_bars(sym, bars)
                 if last is not None:
                     buf = self.ohlcv_buffers[sym]
