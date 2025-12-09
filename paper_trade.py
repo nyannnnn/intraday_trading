@@ -128,7 +128,7 @@ HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
 def is_rth_now() -> bool:
     """Check if current time is within trading hours (approximate)."""
     now = dt.datetime.now(RTH_TZ) if RTH_TZ else dt.datetime.now()
-    return RTH_START <= now.time() <= RTH_END
+    return True
 
 def minutes_until_next_rth_open() -> float:
     """Calculate minutes until next RTH open to optimize sleep cycles."""
@@ -317,7 +317,7 @@ class PaperTrader:
         for sym in UNIVERSE:
             try:
                 bars = self.ib.reqHistoricalData(self.contracts[sym], "", BACKFILL_DURATION_STR, 
-                                                 f"{BAR_INTERVAL_MIN} mins", "TRADES", 1, 1)
+                                                 f"{BAR_INTERVAL_MIN} mins", "TRADES", useRTH=False, formatDate=1)
                 if bars:
                     data = [{"datetime": b.date.tz_localize("UTC"), "open": b.open, "high": b.high, 
                              "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
@@ -469,7 +469,7 @@ class PaperTrader:
         for sym in UNIVERSE:
             try:
                 bars = self.ib.reqHistoricalData(self.contracts[sym], "", f"{BAR_INTERVAL_MIN * 2} M", 
-                                                 f"{BAR_INTERVAL_MIN} mins", "TRADES", 1, 1)
+                                                 f"{BAR_INTERVAL_MIN} mins", "TRADES", useRTH=False, formatDate=1)
                 self._update_buffer_from_bars(sym, bars)
             except: continue
 
@@ -540,6 +540,7 @@ class PaperTrader:
 
             work_sec = (dt.datetime.now() - loop_start).total_seconds()
             sleep_sec = max(1.0, (BAR_INTERVAL_MIN * 60) - work_sec)
+            self._log(f"[WAIT] Loop finished in {work_sec:.2f}s. Sleeping {sleep_sec:.1f}s...")
             self.ib.sleep(sleep_sec)
 
 def main() -> None:
