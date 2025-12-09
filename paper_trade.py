@@ -587,35 +587,50 @@ class PaperTrader:
         self._log(f"[ENTRY-BRACKET] {symbol} sent. Size={size} EstPrice={current_price:.2f} SL={stop_price} TP={tp_price}")
 
     def _close_position(self, symbol: str, pos: Position, exit_price: float, exit_ts: pd.Timestamp, reason: str) -> None:
-        # Cancel any open orders for this symbol first (Clean up the bracket children)
-        open_orders = self.ib.openOrders()
-        for o in open_orders:
-            if o.contract.symbol == symbol:
-                self.ib.cancelOrder(o)
+        """
+        Close a position, cancel any pending orders, and log the result.
+        """
+        # 1. Cancel any open orders for this symbol (Cleanup bracket children)
+        # FIX: Use openTrades() to access the contract associated with the order
+        for t in self.ib.openTrades():
+            if t.contract.symbol == symbol:
+                self.ib.cancelOrder(t.order)
         
-        # Now close the position
-        size = pos.size
-        fills = self._submit_market_order(symbol, -size)
-        
-        if fills is None:
-            self._log(f"[EXIT-FAILED] {symbol}: no fills on close.")
-            return
-            
-        realized = (fills.avg_price - pos.entry_price) * size
-        r_multiple = realized / (STOP_LOSS_PCT * pos.entry_price * size)
+        # 2. If the exit reason is NOT 'BRACKET_HIT', we need to send a market sell.
+        # If it WAS a bracket hit, the position is already gone at IBKR, so we skip the sell order.
+        if reason != "BRACKET_HIT":
+            size = pos.size
+            fills = self._submit_market_order(symbol, -size)
+            if fills is None:
+                self._log(f"[EXIT-FAILED] {symbol}: no fills on close.")
+                return
+            realized_price = fills.avg_price
+        else:
+            # If bracket hit, we use the estimated price passed in (usually close of bar)
+            # ideally we'd find the execution price, but for now this approximates it.
+            realized_price = exit_price
+
+        # 3. Calculate PnL
+        realized = (realized_price - pos.entry_price) * pos.size
+        r_multiple = realized / (STOP_LOSS_PCT * pos.entry_price * pos.size)
         self.realized_pnl_today += realized
+
         if reason == "STOP":
             self.last_stop_bar[symbol] = exit_ts
             
+        # 4. Log & Record
         trade_record = {
             "symbol": symbol, "entry_dt": pos.entry_dt, "exit_dt": exit_ts,
-            "entry_price": pos.entry_price, "exit_price": fills.avg_price,
-            "size": size, "pnl": realized, "r_multiple": r_multiple, "reason": reason,
+            "entry_price": pos.entry_price, "exit_price": realized_price,
+            "size": pos.size, "pnl": realized, "r_multiple": r_multiple, "reason": reason,
         }
         self.trades_today.append(trade_record)
         self._append_trade_to_csv(trade_record)
         self._log(f"[EXIT-{reason}] {symbol}: pnl={realized:.2f}, R={r_multiple:.2f}")
-        del self.positions[symbol]
+        
+        # 5. Remove from local tracking
+        if symbol in self.positions:
+            del self.positions[symbol]
 
     def _maybe_roll_trading_date(self, now_ts: pd.Timestamp) -> None:
         today = now_ts.date()
