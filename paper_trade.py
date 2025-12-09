@@ -323,7 +323,6 @@ class PaperTrader:
         self._log(f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} of {BAR_INTERVAL_MIN}-min RTH bars...")
         for sym in UNIVERSE:
             # === STARTUP PACE LIMITER ===
-            # Sleep 1.0s between requests to avoid Error 162
             self.ib.sleep(1.0)
             
             contract = self.contracts[sym]
@@ -416,7 +415,7 @@ class PaperTrader:
             # 1. Get actual held positions
             ib_positions = self.ib.positions()
             
-            # 2. Get Open Trades to find attached SL/TP
+            # 2. Get Open Trades (using openTrades to link Order+Contract)
             self.ib.reqAllOpenOrders()
             open_trades = self.ib.openTrades()
             
@@ -452,25 +451,23 @@ class PaperTrader:
                 if stop_price == 0 and tp_price == 0:
                     self._log(f"[RESCUE] {sym} is NAKED. Attaching new Hard Bracket...")
                     
-                    # Calculate new levels based on Average Cost
                     new_sl = round(avg_cost * (1.0 - STOP_LOSS_PCT), 2)
                     new_tp = round(avg_cost * (1.0 + TAKE_PROFIT_PCT), 2)
                     
-                    # Define Orders
                     oca_group_name = f"RESCUE_{sym}_{int(time.time())}"
                     
-                    # Explicitly set TIF to 'DAY' to avoid preset errors
+                    # FIX: Explicit TIF='DAY' to avoid 10349 Preset Error
                     sl_order = StopOrder('SELL', pos_size, new_sl)
                     sl_order.ocaGroup = oca_group_name
                     sl_order.ocaType = 1 
-                    sl_order.tif = 'DAY' 
+                    sl_order.tif = 'DAY'
                     
                     tp_order = LimitOrder('SELL', pos_size, new_tp)
                     tp_order.ocaGroup = oca_group_name
                     tp_order.ocaType = 1
                     tp_order.tif = 'DAY'
 
-                    # CRITICAL FIX: Use self.contracts[sym] (SMART) instead of p.contract (NASDAQ)
+                    # FIX: Use SMART contract to avoid Direct Routing errors
                     contract_smart = self.contracts.get(sym)
                     if not contract_smart:
                         contract_smart = Stock(sym, 'SMART', 'USD')
@@ -512,6 +509,9 @@ class PaperTrader:
         action = "BUY" if size > 0 else "SELL"
         self._log(f"[ORDER] Submitting {action} {abs(size)} {symbol} (MKT)...")
         order = MarketOrder(action, abs(size))
+        # FIX: Explicit TIF='DAY'
+        order.tif = 'DAY'
+        
         trade = self.ib.placeOrder(contract, order)
         self.ib.sleep(1)
         elapsed = 0.0
@@ -533,15 +533,22 @@ class PaperTrader:
         stop_price = round(current_price * (1.0 - STOP_LOSS_PCT), 2)
         tp_price = round(current_price * (1.0 + TAKE_PROFIT_PCT), 2)
 
+        # 1. Parent Market Order
         parent = MarketOrder('BUY', size)
         parent.transmit = False 
+        parent.tif = 'DAY' # FIX: Explicit TIF
         
+        # 2. Take Profit
         takeProfit = LimitOrder('SELL', size, tp_price)
         takeProfit.transmit = False
+        takeProfit.tif = 'DAY' # FIX: Explicit TIF
         
+        # 3. Stop Loss
         stopLoss = StopOrder('SELL', size, stop_price)
         stopLoss.transmit = True 
+        stopLoss.tif = 'DAY' # FIX: Explicit TIF
 
+        # Linking
         parent.orderId = self.ib.client.getReqId()
         takeProfit.parentId = parent.orderId
         stopLoss.parentId = parent.orderId
@@ -564,6 +571,7 @@ class PaperTrader:
         Close a position, cancel any pending orders, and log the result.
         """
         # 1. Cancel any open orders for this symbol (Cleanup bracket children)
+        # FIX: Use openTrades() to verify symbol
         for t in self.ib.openTrades():
             if t.contract.symbol == symbol:
                 self.ib.cancelOrder(t.order)
@@ -628,7 +636,6 @@ class PaperTrader:
         # 1. Fetch Bars
         for sym in UNIVERSE:
             # === PACE LIMITER ===
-            # Sleep 1.0s between requests to avoid Error 162 (Pacing Violation)
             self.ib.sleep(1.0) 
             
             contract = self.contracts[sym]
@@ -644,11 +651,10 @@ class PaperTrader:
             last = self._update_buffer_from_bars(sym, bars)
             if last is None: continue
 
-        # 2. Check Exits (Wait, if we use Brackets, IBKR exits for us.
-        # BUT we still monitor here to log the exit if it happens externally)
+        # 2. Check Exits (IBKR brackets handle exits, but we monitor for logging)
         for sym, pos in list(self.positions.items()):
-            # Check if position is gone in IBKR (hit bracket)
             ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
+            # If position is gone, Bracket was hit
             if sym not in ib_positions or ib_positions[sym] == 0:
                 self._log(f"[EXIT-DETECTED] {sym} no longer in portfolio (Bracket hit?).")
                 buf = self.ohlcv_buffers.get(sym)
@@ -656,7 +662,7 @@ class PaperTrader:
                 self._close_position(sym, pos, close, now_ts, "BRACKET_HIT")
                 continue
             
-            # Time Stop (We still need to enforce this manually)
+            # Time Stop Check
             buf = self.ohlcv_buffers.get(sym)
             if buf is None or buf.empty: continue
             last_ts = buf.index[-1]
@@ -685,7 +691,6 @@ class PaperTrader:
             x = feat_vals.to_frame().T
             p_up = float(self.clf.predict_proba(x)[0, 1])
 
-            # Filter noise from log
             if p_up > 0.5:
                 self._log(f"[SIGNAL] {sym}: p_up={p_up:.3f}")
 
