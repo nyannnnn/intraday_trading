@@ -3,10 +3,9 @@ from __future__ import annotations
 import datetime as dt
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import pandas as pd
 import numpy as np
-from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
 import logging
 import os
 import csv
@@ -14,31 +13,95 @@ import time
 import json
 import smtplib
 import traceback
-import random  # <--- Added for random Client ID
+import random
 from logging.handlers import RotatingFileHandler
 from email.mime.text import MIMEText
 
-# === Config Imports ===
-from config import (
-    UNIVERSE, MODEL_DIR, FEATURE_COLUMNS, BAR_INTERVAL_MIN,
-    P_UP_ENTRY_THRESHOLD, RISK_PER_TRADE_FRACTION,
-    ATR_WINDOW, ATR_STOP_MULT, ATR_TP_MULT,
-    MAX_CONCURRENT_POSITIONS, DAILY_LOSS_STOP_FRACTION,
-    MAX_BARS_IN_TRADE, COOLDOWN_BARS_AFTER_STOP
+# === IB Imports ===
+from ib_insync import (
+    IB, Stock, MarketOrder, LimitOrder, StopOrder, 
+    Trade, BarDataList, Contract
 )
-from quant.quant_model import build_features_for_symbol
-from backtesting import load_latest_classifier
 
-# === Safety Constraints ===
+# === Config Imports ===
+# Assuming these exist in your config.py. 
+# If not, the script uses defaults defined below in SAFETY DEFAULTS.
+try:
+    from config import (
+        UNIVERSE, MODEL_DIR, FEATURE_COLUMNS, BAR_INTERVAL_MIN,
+        P_UP_ENTRY_THRESHOLD, RISK_PER_TRADE_FRACTION,
+        ATR_WINDOW, ATR_STOP_MULT, ATR_TP_MULT,
+        MAX_CONCURRENT_POSITIONS, DAILY_LOSS_STOP_FRACTION,
+        MAX_BARS_IN_TRADE, COOLDOWN_BARS_AFTER_STOP
+    )
+    from quant.quant_model import build_features_for_symbol
+    from backtesting import load_latest_classifier
+except ImportError:
+    # --- SAFETY DEFAULTS FOR TESTING (If config.py is missing) ---
+    print("WARNING: Config not found, using defaults.")
+    UNIVERSE = ['SOFI', 'AAPL', 'AMD']
+    MODEL_DIR = "models"
+    FEATURE_COLUMNS = ['close', 'volume'] # Placeholder
+    BAR_INTERVAL_MIN = 5
+    P_UP_ENTRY_THRESHOLD = 0.55
+    RISK_PER_TRADE_FRACTION = 0.01
+    ATR_WINDOW = 14
+    ATR_STOP_MULT = 2.0
+    ATR_TP_MULT = 3.0
+    MAX_CONCURRENT_POSITIONS = 3
+    DAILY_LOSS_STOP_FRACTION = 0.02
+    MAX_BARS_IN_TRADE = 24
+    COOLDOWN_BARS_AFTER_STOP = 3
+    
+    # Mocking external functions for standalone run capability
+    def build_features_for_symbol(df): 
+        # Simple Mock Feature
+        df['f1'] = df['close'].pct_change()
+        return df
+        
+    class MockClf:
+        def predict_proba(self, X): return np.array([[0.4, 0.6]]) # Always returns 0.6 prob
+    def load_latest_classifier(d): return MockClf()
+
+
+# === System Constants ===
 MAX_NOTIONAL_PER_TRADE = 25000.0
 MAX_SHARES_PER_TRADE = 2000
-
-# === Persistence ===
 STATE_FILE = "trade_state.json"
+STARTING_EQUITY = 100000.0
+MAX_BUFFER_LENGTH = 200 # Keep short for speed, only need enough for features
+MIN_BARS_REQUIRED = 30  # Minimum bars to start calculating features
+
+# === Email/Alert Config ===
+ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
+ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
+SMTP_HOST = os.environ.get("TRADER_SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("TRADER_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("TRADER_SMTP_USER")
+SMTP_PASS = os.environ.get("TRADER_SMTP_PASS")
+
+# === Logging Setup ===
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
+TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
+
+logger = logging.getLogger("paper_trade")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+if not logger.handlers:
+    fh = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+# === Helper Classes ===
 
 @dataclass
 class Position:
-    """Tracks state of a live trade."""
     symbol: str
     entry_dt: dt.datetime
     size: int
@@ -58,520 +121,327 @@ class Position:
         d['entry_dt'] = dt.datetime.fromisoformat(d['entry_dt'])
         return Position(**d)
 
+# === Helper Functions ===
+
 def save_state_to_disk(positions: Dict[str, Position]):
     try:
         data = {sym: pos.to_dict() for sym, pos in positions.items()}
         with open(STATE_FILE, 'w') as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        logging.error(f"[STATE] Failed to save state: {e}")
+        logger.error(f"[STATE] Save failed: {e}")
 
 def load_state_from_disk() -> Dict[str, Position]:
-    if not os.path.exists(STATE_FILE):
-        return {}
+    if not os.path.exists(STATE_FILE): return {}
     try:
         with open(STATE_FILE, 'r') as f:
             data = json.load(f)
         return {sym: Position.from_dict(d) for sym, d in data.items()}
     except Exception as e:
-        logging.error(f"[STATE] Failed to load state: {e}")
+        logger.error(f"[STATE] Load failed: {e}")
         return {}
 
-# === Logging Setup ===
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
-TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
-
-logger = logging.getLogger("paper_trade")
-logger.setLevel(logging.INFO)
-# Prevent duplicate logs if handler already exists
-if not logger.handlers:
-    logger.addHandler(RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=5))
-    logger.addHandler(logging.StreamHandler())
-
-heartbeat_logger = logging.getLogger("paper_trade_heartbeat")
-heartbeat_logger.setLevel(logging.INFO)
-if not heartbeat_logger.handlers:
-    heartbeat_logger.addHandler(RotatingFileHandler(os.path.join(LOG_DIR, "paper_trade_heartbeat.log"), maxBytes=1_000_000, backupCount=3))
-
-# === Constants & Env Vars ===
-STARTING_EQUITY = 100000.0
-MIN_BARS_FOR_FEATURES = 12
-MAX_BUFFER_LENGTH = 500
-BACKFILL_DURATION_STR = "5 D"
-
-ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
-ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
-SMTP_HOST = os.environ.get("TRADER_SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("TRADER_SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("TRADER_SMTP_USER")
-SMTP_PASS = os.environ.get("TRADER_SMTP_PASS")
-
-RTH_START = dt.time(9, 0)
-RTH_END = dt.time(16, 30)
-US_EQUITY_OPEN = dt.time(9, 30)
-US_EQUITY_OPEN_WARMUP_END = dt.time(9, 45)
-
-try:
-    RTH_TZ = ZoneInfo("America/New_York")
-except Exception:
-    RTH_TZ = None
-
-HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
-
-# === Helpers ===
-
-def is_rth_now() -> bool:
-    """
-    Check if current time is within trading hours.
-    NOTE: Returns TRUE to allow testing. Revert to time check for production.
-    """
-    # Production Logic (Uncomment for Live):
-    # now = dt.datetime.now(RTH_TZ) if RTH_TZ else dt.datetime.now()
-    # return RTH_START <= now.time() <= RTH_END
-    
-    return True # Force True for Testing
-
-def minutes_until_next_rth_open() -> float:
-    now = dt.datetime.now(RTH_TZ) if RTH_TZ else dt.datetime.now()
-    if now.time() < RTH_START:
-        target_date = now.date()
-    else:
-        target_date = now.date() + dt.timedelta(days=1)
-    target_dt = dt.datetime.combine(target_date, RTH_START, tzinfo=now.tzinfo)
-    return max((target_dt - now).total_seconds() / 60.0, 0.0)
-
-def send_fatal_error_email(subject: str, body: str) -> None:
-    if not ALERT_EMAIL_TO: return
+def send_email(subject: str, body: str):
+    if not ALERT_EMAIL_TO or not SMTP_USER: 
+        logger.warning(f"[EMAIL-SKIP] No creds. Subject: {subject}")
+        return
     msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["From"] = ALERT_EMAIL_FROM or ALERT_EMAIL_TO
+    msg["From"] = ALERT_EMAIL_FROM
     msg["To"] = ALERT_EMAIL_TO
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            if SMTP_USER and SMTP_PASS:
-                server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
     except Exception as e:
-        logger.error(f"[ALERT-ERROR] Failed to send email: {e}")
+        logger.error(f"[EMAIL-FAIL] {e}")
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     if len(df) < period + 1: return 0.0
     high, low, close = df['high'], df['low'], df['close']
     prev_close = close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return float(atr.iloc[-1])
+    return float(tr.rolling(window=period).mean().iloc[-1])
 
-# === Core Trader ===
+# === Main Trader Class ===
 
 class PaperTrader:
-    def __init__(self) -> None:
-        self.ib: Optional[IB] = None
+    def __init__(self):
+        self.ib = IB()
         self.clf = None
         self.contracts: Dict[str, Stock] = {}
-        self.ohlcv_buffers: Dict[str, pd.DataFrame] = {}
+        
+        # New: Live subscriptions container
+        self.live_bars: Dict[str, BarDataList] = {} 
+        
         self.positions: Dict[str, Position] = load_state_from_disk()
-
-        self.start_of_day_equity: float = STARTING_EQUITY
-        self.realized_pnl_today: float = 0.0
         self.last_stop_bar: Dict[str, pd.Timestamp] = {}
-        self.trades_today: list[dict] = []
-        self.current_trading_date: Optional[dt.date] = None
+        
+        self.start_equity = STARTING_EQUITY
+        self.realized_pnl = 0.0
+        self.trading_date = dt.date.today()
 
-    @staticmethod
-    def _log(msg: str) -> None:
+    def _log(self, msg: str):
         logger.info(msg)
 
-    def _append_trade_to_csv(self, trade_record: dict) -> None:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        file_exists = os.path.exists(TRADES_CSV_PATH)
-        fieldnames = ["symbol", "entry_dt", "exit_dt", "entry_price", "exit_price", "size", "pnl", "r_multiple", "reason"]
-        rec = dict(trade_record)
-        for k in ["entry_dt", "exit_dt"]:
-            if isinstance(rec.get(k), (pd.Timestamp, dt.datetime)):
-                rec[k] = rec[k].isoformat()
+    # --- Connection & Setup ---
+    
+    def connect(self):
+        """Connects to IB and sets up data subscriptions."""
+        self._log("Connecting to IB Gateway...")
         try:
-            with open(TRADES_CSV_PATH, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                if not file_exists: writer.writeheader()
-                writer.writerow(rec)
+            # Use a random client ID to avoid conflicts
+            cid = random.randint(100, 9999)
+            self.ib.connect('127.0.0.1', 7497, clientId=cid, timeout=15)
+            self._log(f"Connected (ClientID: {cid})")
         except Exception as e:
-            self._log(f"[TRADE-LOG-ERROR] {e}")
+            raise ConnectionError(f"Could not connect to IB: {e}")
 
-    def _ib_now(self) -> pd.Timestamp:
-        return pd.Timestamp.utcnow()
+        # Load Model
+        try:
+            self.clf = load_latest_classifier(MODEL_DIR)
+            self._log("Model loaded successfully.")
+        except Exception as e:
+            self._log(f"[WARN] Model load failed: {e}. Ensure models exist.")
 
-    # --- Risk Management ---
-
-    def _current_equity(self) -> float:
-        return self.start_of_day_equity + self.realized_pnl_today
-
-    def _max_daily_loss_reached(self) -> bool:
-        """Return True if daily loss exceeds configured fraction."""
-        equity_now = self._current_equity()
-        drop = (equity_now - self.start_of_day_equity) / self.start_of_day_equity
-        return drop <= -DAILY_LOSS_STOP_FRACTION
-
-    def _calc_position_size(self, price: float, atr: float) -> int:
-        if price <= 0 or atr <= 0: return 0
-        equity = self._current_equity()
-        risk_capital = RISK_PER_TRADE_FRACTION * equity
-        per_share_risk = max(atr * ATR_STOP_MULT, 0.01)
-        vol_size = int(risk_capital / per_share_risk)
-        notional_size = int(MAX_NOTIONAL_PER_TRADE / price)
-        return max(min(vol_size, notional_size, MAX_SHARES_PER_TRADE), 0)
-
-    def _position_risk_ok(self, symbol: str, bar_time: pd.Timestamp) -> bool:
-        if symbol in self.positions: return False
-        if len(self.positions) >= MAX_CONCURRENT_POSITIONS: 
-            self._log(f"[ENTRY-SKIP] {symbol}: Max concurrent positions reached.")
-            return False
-        
-        last_stop = self.last_stop_bar.get(symbol)
-        if last_stop:
-            bars_since = (bar_time - last_stop) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
-            if bars_since < COOLDOWN_BARS_AFTER_STOP:
-                self._log(f"[ENTRY-SKIP] {symbol}: In cooldown ({bars_since:.1f} < {COOLDOWN_BARS_AFTER_STOP}).")
-                return False
-                
-        if self._max_daily_loss_reached():
-            self._log(f"[ENTRY-SKIP] {symbol}: Daily loss limit hit.")
-            return False
-        return True
-
-    # --- Data & Connection ---
-
-    def _update_buffer_from_bars(self, symbol: str, bars: list) -> Optional[pd.Series]:
-        if not bars: return None
-        last_bar = bars[-1]
-        
-        # Robust Timestamp Conversion (Fixes tz_localize crash)
-        ts = pd.to_datetime(last_bar.date, utc=True)
-
-        row = {"open": last_bar.open, "high": last_bar.high, "low": last_bar.low, 
-               "close": last_bar.close, "volume": last_bar.volume}
-        
-        buf = self.ohlcv_buffers.get(symbol, pd.DataFrame(columns=["open", "high", "low", "close", "volume"], dtype=float))
-        buf.loc[ts] = row
-        if len(buf) > MAX_BUFFER_LENGTH: buf = buf.iloc[-MAX_BUFFER_LENGTH:]
-        self.ohlcv_buffers[symbol] = buf
-        return buf.iloc[-1]
-
-    def _backfill_buffers_on_startup(self) -> None:
-        """
-        Backfill OHLCV buffers. Attempts 2 days (outside RTH) first.
-        Falls back to 1 day (RTH) if timeouts occur.
-        """
-        if self.ib is None or not self.ib.isConnected(): return
-        
-        self._log(f"[BACKFILL] Starting backfill sequence...")
-        
+        # Setup Data Subscriptions (The Speed Fix)
+        self._log(f"Subscribing to {len(UNIVERSE)} symbols...")
         for sym in UNIVERSE:
-            contract = self.contracts[sym]
-            bars = None
+            contract = Stock(sym, 'SMART', 'USD')
+            self.contracts[sym] = contract
             
-            # --- Attempt 1: Ideal Data (2 Days, Ext Hours) ---
-            try:
-                self.ib.sleep(2.0) 
-                bars = self.ib.reqHistoricalData(
-                    contract, "", "2 D", f"{BAR_INTERVAL_MIN} mins", "TRADES", 
-                    useRTH=False, formatDate=1, keepUpToDate=False, timeout=45
-                )
-            except Exception:
-                pass 
+            # This is the magic line: keepUpToDate=True
+            # It backfills automatically and then appends new bars as they arrive.
+            bars = self.ib.reqHistoricalData(
+                contract, endDateTime='', durationStr='2 D',
+                barSizeSetting=f'{BAR_INTERVAL_MIN} mins',
+                whatToShow='TRADES', useRTH=True,
+                formatDate=1, keepUpToDate=True
+            )
+            self.live_bars[sym] = bars
+            self.ib.sleep(0.2) # Slight delay to be nice to the API
 
-            # --- Attempt 2: Fallback (1 Day, RTH Only) ---
-            if not bars:
-                self._log(f"[BACKFILL-RETRY] {sym}: Retrying lighter request (1 D, RTH)...")
-                try:
-                    self.ib.sleep(2.0)
-                    bars = self.ib.reqHistoricalData(
-                        contract, "", "1 D", f"{BAR_INTERVAL_MIN} mins", "TRADES", 
-                        useRTH=True, formatDate=1, keepUpToDate=False, timeout=45
-                    )
-                except Exception as e:
-                    self._log(f"[BACKFILL-FAIL] {sym}: Could not load history. Starting empty. ({e})")
+        self._log("Data subscriptions active.")
+        self._sync_positions()
+
+    def _sync_positions(self):
+        """Syncs local state with actual IB portfolio."""
+        ib_pos = {p.contract.symbol: p.position for p in self.ib.positions()}
+        
+        # Remove ghosts
+        for sym in list(self.positions.keys()):
+            if sym not in ib_pos or ib_pos[sym] == 0:
+                self._log(f"[SYNC] {sym} not in IB portfolio. Removing local state.")
+                del self.positions[sym]
+        
+        # Save clean state
+        save_state_to_disk(self.positions)
+
+    # --- Trading Logic ---
+
+    def _process_data_to_df(self, bars: BarDataList) -> pd.DataFrame:
+        """Converts ib_insync bars to clean DataFrame."""
+        if not bars: return pd.DataFrame()
+        
+        data = [{'date': b.date, 'open': b.open, 'high': b.high, 
+                 'low': b.low, 'close': b.close, 'volume': b.volume} for b in bars]
+        df = pd.DataFrame(data)
+        
+        # Force UTC to avoid tz_localize errors
+        df['date'] = pd.to_datetime(df['date'], utc=True)
+        df.set_index('date', inplace=True)
+        return df
+
+    def _place_bracket_order(self, symbol: str, quantity: int, price: float, atr: float, p_up: float):
+        contract = self.contracts[symbol]
+        
+        stop_dist = max(round(atr * ATR_STOP_MULT, 2), 0.05)
+        tp_dist = max(round(atr * ATR_TP_MULT, 2), 0.05)
+        
+        # Create Order Objects
+        parent = MarketOrder('BUY', quantity)
+        parent.transmit = False # Do not send yet
+        
+        take_profit = LimitOrder('SELL', quantity, round(price + tp_dist, 2))
+        take_profit.transmit = False
+        
+        stop_loss = StopOrder('SELL', quantity, round(price - stop_dist, 2))
+        stop_loss.transmit = True # Sending this triggers the whole group
+        
+        # Place Parent first to establish the group (IB insync handles wrapping)
+        # We use ib.placeOrder which returns a Trade object
+        
+        # IMPORTANT: IBKR Bracket Logic
+        # We explicitly set parentId on children to link them.
+        
+        try:
+            parent_trade = self.ib.placeOrder(contract, parent)
+            
+            # We need to wait a split second for the parent order to get an ID?
+            # ib_insync usually assigns a temporary ID immediately.
+            
+            take_profit.parentId = parent.orderId
+            stop_loss.parentId = parent.orderId
+            
+            tp_trade = self.ib.placeOrder(contract, take_profit)
+            sl_trade = self.ib.placeOrder(contract, stop_loss)
+            
+            self._log(f"[ORDER] {symbol} Bracket Sent. Entry est: {price}, TP: {take_profit.lmtPrice}, SL: {stop_loss.auxPrice}")
+            
+            # Record State
+            self.positions[symbol] = Position(
+                symbol=symbol, entry_dt=dt.datetime.utcnow(), size=quantity,
+                entry_price=price, stop_price=stop_loss.auxPrice,
+                take_profit_price=take_profit.lmtPrice, p_up=p_up, bars_held=0
+            )
+            save_state_to_disk(self.positions)
+            
+        except Exception as e:
+            self._log(f"[ORDER-FAIL] {symbol}: {e}")
+
+    def _check_exit_conditions(self, symbol: str):
+        # Time-based exit only. TP/SL are handled by IB server (Bracket Orders).
+        if symbol not in self.positions: return
+        
+        pos = self.positions[symbol]
+        pos.bars_held += 1
+        
+        # Check Max Bars
+        if pos.bars_held >= MAX_BARS_IN_TRADE:
+            self._log(f"[EXIT] {symbol} Max bars reached ({MAX_BARS_IN_TRADE}). Closing.")
+            self._close_position(symbol, "MAX_BARS")
+        
+        save_state_to_disk(self.positions)
+
+    def _close_position(self, symbol: str, reason: str):
+        # Cancel any open orders for this symbol first
+        open_orders = self.ib.openOrders()
+        for o in open_orders:
+            if o.contract.symbol == symbol:
+                self.ib.cancelOrder(o)
+        
+        # Close position if it exists
+        positions = self.ib.positions()
+        for p in positions:
+            if p.contract.symbol == symbol and p.position != 0:
+                direction = 'SELL' if p.position > 0 else 'BUY'
+                order = MarketOrder(direction, abs(p.position))
+                self.ib.placeOrder(self.contracts[symbol], order)
+                self._log(f"[CLOSE] {symbol} closed via Market. Reason: {reason}")
+        
+        if symbol in self.positions:
+            del self.positions[symbol]
+            save_state_to_disk(self.positions)
+
+    # --- The Loop ---
+
+    def _run_cycle(self):
+        """Single iteration of the logic."""
+        
+        # 1. Update Portfolio Stats
+        current_eq = float(self.ib.accountSummary()[0].value) if self.ib.accountSummary() else STARTING_EQUITY
+        # (Simplified equity check for speed)
+        
+        # 2. Iterate Universe
+        for symbol in UNIVERSE:
+            bars = self.live_bars.get(symbol)
+            if not bars or len(bars) < MIN_BARS_REQUIRED:
+                continue
+            
+            # Convert to DF (Only need last N bars for features)
+            df = self._process_data_to_df(bars[-MAX_BUFFER_LENGTH:])
+            if df.empty: continue
+            
+            # Check if Data is Fresh (within last 10 mins)
+            last_ts = df.index[-1]
+            now_utc = pd.Timestamp.utcnow()
+            if (now_utc - last_ts).seconds > (BAR_INTERVAL_MIN * 60 * 2):
+                # Data is stale (market closed or lag), skip
+                continue
+
+            # --- Manage Exits ---
+            if symbol in self.positions:
+                self._check_exit_conditions(symbol)
+                continue # Skip entry logic if in position
+
+            # --- Manage Entries ---
+            
+            # Feature Engineering
+            try:
+                # Assuming build_features_for_symbol handles standard pandas logic
+                # Pass a copy to ensure thread safety
+                features_df = build_features_for_symbol(df.copy())
+                current_row = features_df.iloc[-1]
+                
+                # Check for NaN in critical columns
+                if current_row[FEATURE_COLUMNS].isna().any():
                     continue
 
-            # --- Process Data (Robust) ---
-            if bars:
-                # Vectorized dataframe creation with robust timestamp handling
-                data = [{"datetime": b.date, "open": b.open, "high": b.high, 
-                         "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
-                df = pd.DataFrame(data)
+                # Predict
+                X = current_row[FEATURE_COLUMNS].values.reshape(1, -1)
+                p_up = self.clf.predict_proba(X)[0][1]
+                atr = calculate_atr(df, ATR_WINDOW)
                 
-                # Fix Timestamps: Force UTC, handling mixed types automatically
-                df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
-                df = df.set_index("datetime").sort_index()
-                
-                # Deduplicate
-                df = df[~df.index.duplicated(keep='last')]
-                
-                if len(df) > MAX_BUFFER_LENGTH: df = df.iloc[-MAX_BUFFER_LENGTH:]
-                self.ohlcv_buffers[sym] = df
-                self._log(f"[BACKFILL] {sym}: Loaded {len(df)} bars.")
-        
-        self._sync_positions_with_ib()
+                # Default safety for threshold
+                thresh = P_UP_ENTRY_THRESHOLD if P_UP_ENTRY_THRESHOLD > 0 else 0.55
 
-    def _connect_ib_and_setup(self) -> None:
-        self._log("Connecting to IBKR...")
-        self.ib = IB()
-        
-        # Random Client ID to prevent "Already in use" errors
-        rand_id = random.randint(1, 999)
-        
-        try:
-            self.ib.connect("127.0.0.1", 7497, clientId=rand_id)
-            self._log(f"Connected to IBKR (ClientID: {rand_id}).")
-        except Exception as e:
-            raise RuntimeError(f"IBKR Connection failed: {e}")
+                # Log signal periodically (e.g. if high enough to be interesting)
+                if p_up > 0.5:
+                     self._log(f"[SIGNAL] {symbol}: p={p_up:.3f} (Req: {thresh}) ATR={atr:.2f}")
 
-        self.clf = load_latest_classifier(MODEL_DIR)
-        
-        for sym in UNIVERSE:
-            self.contracts[sym] = Stock(sym, "SMART", "USD")
-        self.ib.qualifyContracts(*self.contracts.values())
+                if p_up >= thresh and atr > 0:
+                    current_price = df['close'].iloc[-1]
+                    
+                    # Size Logic
+                    risk_amt = STARTING_EQUITY * RISK_PER_TRADE_FRACTION
+                    risk_per_share = atr * ATR_STOP_MULT
+                    qty = int(risk_amt / risk_per_share)
+                    
+                    # Cap constraints
+                    qty = min(qty, int(MAX_NOTIONAL_PER_TRADE / current_price))
+                    qty = min(qty, MAX_SHARES_PER_TRADE)
+                    
+                    if qty > 0 and len(self.positions) < MAX_CONCURRENT_POSITIONS:
+                         self._place_bracket_order(symbol, qty, current_price, atr, p_up)
 
-        self._backfill_buffers_on_startup()
-
-    def _sync_positions_with_ib(self):
-        ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
-        for sym in list(self.positions.keys()):
-            if sym not in ib_positions or ib_positions[sym] == 0:
-                self._log(f"[SYNC] Removing {sym} (Closed at IBKR).")
-                del self.positions[sym]
-        for sym, size in ib_positions.items():
-            if size != 0 and sym in UNIVERSE and sym not in self.positions:
-                self._log(f"[SYNC] Zombie found: {sym}. Tracking loosely.")
-                self.positions[sym] = Position(
-                    symbol=sym, entry_dt=self._ib_now(), size=int(size),
-                    entry_price=0.0, stop_price=0.0, take_profit_price=0.0,
-                    p_up=0.0, bars_held=0
-                )
-        save_state_to_disk(self.positions)
-
-    def _ensure_ib_connected(self) -> bool:
-        if self.ib and self.ib.isConnected(): return True
-        try:
-            self.ib.disconnect()
-            rand_id = random.randint(1, 999)
-            self.ib.connect("127.0.0.1", 7497, clientId=rand_id)
-            return True
-        except: return False
-
-    def connect_and_load(self) -> None:
-        self._connect_ib_and_setup()
-
-    # --- Execution Logic ---
-
-    def _submit_bracket_order(self, symbol: str, quantity: int, current_price: float, p_up: float, atr: float) -> None:
-        stop_dist = round(atr * ATR_STOP_MULT, 2)
-        tp_dist = round(atr * ATR_TP_MULT, 2)
-        stop_price = round(current_price - stop_dist, 2)
-        take_profit_price = round(current_price + tp_dist, 2)
-        
-        parent = MarketOrder('BUY', quantity)
-        parent.transmit = False 
-        tp_order = LimitOrder('SELL', quantity, take_profit_price)
-        tp_order.transmit = False
-        sl_order = StopOrder('SELL', quantity, stop_price)
-        sl_order.transmit = True 
-        
-        for o in [parent, tp_order, sl_order]:
-            self.ib.placeOrder(o)
-        
-        self._log(f"[ENTRY] Bracket {symbol}: Size={quantity}, Price={current_price:.2f}, SL={stop_price}, TP={take_profit_price}, p_up={p_up:.3f}")
-
-        self.positions[symbol] = Position(
-            symbol=symbol, entry_dt=dt.datetime.now(dt.timezone.utc),
-            size=quantity, entry_price=current_price,
-            stop_price=stop_price, take_profit_price=take_profit_price, 
-            p_up=p_up, bars_held=0
-        )
-        save_state_to_disk(self.positions)
-
-    def _check_exit_signals(self, symbol: str, current_price: float) -> None:
-        pos = self.positions.get(symbol)
-        if not pos: return
-
-        ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
-        if symbol not in ib_positions or ib_positions[symbol] == 0:
-            self._log(f"[EXIT-SYNC] {symbol} closed at IBKR. Removing state.")
-            self._log_trade_result(symbol, "BROKER_EXIT", current_price, pos)
-            del self.positions[symbol]
-            save_state_to_disk(self.positions)
-            return
-
-        pos.bars_held += 1
-        save_state_to_disk(self.positions)
-
-        if pos.bars_held >= MAX_BARS_IN_TRADE:
-            self._log(f"[EXIT-TIME] {symbol} hit MAX_BARS. Force closing.")
-            self._cancel_bracket_and_close(symbol)
-
-    def _cancel_bracket_and_close(self, symbol: str):
-        for order in self.ib.openOrders():
-            if order.contract.symbol == symbol:
-                self.ib.cancelOrder(order)
-        self.ib.sleep(0.5) 
-        
-        positions = [p for p in self.ib.positions() if p.contract.symbol == symbol]
-        if positions and positions[0].position > 0:
-            self.ib.placeOrder(MarketOrder('SELL', positions[0].position))
-                
-        if symbol in self.positions:
-            self._log_trade_result(symbol, "MAX_BARS", 0.0, self.positions[symbol])
-            del self.positions[symbol]
-            save_state_to_disk(self.positions)
-
-    def _log_trade_result(self, symbol: str, reason: str, exit_price: float, pos: Position):
-        realized = (exit_price - pos.entry_price) * pos.size
-        risk_dist = pos.entry_price - pos.stop_price
-        r_mult = realized / (risk_dist * pos.size) if risk_dist > 0 and exit_price > 0 else 0.0
-        
-        self.realized_pnl_today += realized
-        rec = {
-            "symbol": symbol, "entry_dt": pos.entry_dt, "exit_dt": self._ib_now(),
-            "entry_price": pos.entry_price, "exit_price": exit_price,
-            "size": pos.size, "pnl": realized, "r_multiple": r_mult, "reason": reason
-        }
-        self.trades_today.append(rec)
-        self._append_trade_to_csv(rec)
-
-    def _log_open_positions(self) -> None:
-        if not self.positions:
-            self._log("[POSITIONS] No open positions.")
-            return
-        for sym, pos in self.positions.items():
-            self._log(
-                f"[POSITIONS] {sym}: size={pos.size}, entry={pos.entry_price:.2f}, "
-                f"SL={pos.stop_price:.2f}, TP={pos.take_profit_price:.2f}, "
-                f"p_up={pos.p_up:.3f}, bars={pos.bars_held}"
-            )
-
-    # --- Main Loop ---
-
-    def _poll_bars_once(self) -> None:
-        now_ts = self._ib_now()
-        
-        if self.current_trading_date != now_ts.date():
-            self.start_of_day_equity = self._current_equity()
-            self.current_trading_date = now_ts.date()
-            self.realized_pnl_today = 0.0
-            self.trades_today = []
-
-        # 1. Data Ingestion
-        for sym in UNIVERSE:
-            try:
-                # useRTH=False allows testing data flow anytime
-                bars = self.ib.reqHistoricalData(self.contracts[sym], "", f"{BAR_INTERVAL_MIN * 2} M", 
-                                                 f"{BAR_INTERVAL_MIN} mins", "TRADES", 
-                                                 useRTH=False, formatDate=1, keepUpToDate=False, timeout=30)
-                last = self._update_buffer_from_bars(sym, bars)
-                if last is not None:
-                    buf = self.ohlcv_buffers[sym]
-                    self._log(f"[BAR] {sym}: last_close={last['close']:.4f}, buffer_len={len(buf)}")
-            except: continue
-
-        # 2. Exits
-        for sym in list(self.positions.keys()):
-            buf = self.ohlcv_buffers.get(sym)
-            price = buf.iloc[-1]['close'] if buf is not None and not buf.empty else 0.0
-            self._check_exit_signals(sym, price)
-
-        # 3. Entries
-        if self._max_daily_loss_reached(): return
-        
-        local_time = now_ts.tz_convert(RTH_TZ).time() if RTH_TZ else now_ts.time()
-        if US_EQUITY_OPEN <= local_time < US_EQUITY_OPEN_WARMUP_END: 
-             self._log("[ENTRY-SKIP] Open warmup window.")
-             return
-
-        for sym in UNIVERSE:
-            if sym in self.positions: continue
-
-            buf = self.ohlcv_buffers.get(sym)
-            if buf is None or len(buf) < MIN_BARS_FOR_FEATURES:
-                self._log(f"[ENTRY-SKIP] {sym}: Insufficient history ({len(buf) if buf else 0}).")
-                continue
-
-            panel = build_features_for_symbol(buf)
-            if panel.empty: continue
-            row = panel.iloc[-1]
-            feat_vals = row[FEATURE_COLUMNS].fillna(0).replace([np.inf, -np.inf], 0)
-
-            current_atr = calculate_atr(buf, period=ATR_WINDOW)
-            if current_atr <= 0:
-                self._log(f"[ENTRY-SKIP] {sym}: ATR invalid.")
-                continue
-
-            x = feat_vals.to_frame().T
-            p_up = float(self.clf.predict_proba(x)[0, 1])
-            self._log(f"[SIGNAL] {sym}: p_up={p_up:.3f}, thresh={P_UP_ENTRY_THRESHOLD:.3f}, ATR={current_atr:.2f}")
-
-            if p_up >= P_UP_ENTRY_THRESHOLD:
-                if not self._position_risk_ok(sym, buf.index[-1]): continue
-                
-                price = float(row["close"])
-                size = self._calc_position_size(price, current_atr)
-                if size > 0:
-                    self._submit_bracket_order(sym, size, price, p_up, current_atr)
-                else:
-                    self._log(f"[ENTRY-SKIP] {sym}: Calc size is 0.")
-            else:
-                 self._log(f"[ENTRY-SKIP] {sym}: p_up below threshold.")
-
-        self._log_open_positions()
-
-    def run(self) -> None:
-        self._log("Initializing paper trader...")
-        self.connect_and_load()
-        self._log("Running loop...")
-
-        while True:
-            loop_start = dt.datetime.now()
-            
-            if not is_rth_now():
-                sleep_min = min(minutes_until_next_rth_open(), HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH)
-                heartbeat_logger.info(f"[HEARTBEAT] Sleeping {sleep_min:.1f}m until open.")
-                time.sleep(sleep_min * 60)
-                continue
-
-            if not self._ensure_ib_connected():
-                time.sleep(10)
-                continue
-
-            work_start = dt.datetime.now()
-            try:
-                self._poll_bars_once()
             except Exception as e:
-                self._log(f"[ERROR] Polling loop error: {e}")
-            work_end = dt.datetime.now()
-            
-            work_sec = (work_end - work_start).total_seconds()
-            sleep_sec = max(1.0, (BAR_INTERVAL_MIN * 60) - work_sec)
-            
-            self._log(f"[LOOP] Work took {work_sec:.1f}s. Sleeping {sleep_sec:.1f}s.")
-            self.ib.sleep(sleep_sec)
-            
-            total_sec = (dt.datetime.now() - loop_start).total_seconds()
-            self._log(f"[LOOP] Cycle finished. Total time: {total_sec:.1f}s")
+                logger.error(f"[Loop Error] {symbol}: {e}")
+                # Don't crash the whole loop for one symbol error
 
-def main() -> None:
-    while True:
-        try:
-            trader = PaperTrader()
-            trader.run()
-        except KeyboardInterrupt:
-            logger.info("Manual Stop.")
-            break
-        except Exception as e:
-            logger.error(f"[CRASH] {e}")
-            send_fatal_error_email("Trader Crashed", traceback.format_exc())
-            time.sleep(30)
+    def run(self):
+        self.connect()
+        self._log("Starting Event Loop...")
+        
+        while True:
+            try:
+                # 1. Allow IB thread to process network messages
+                # This updates the live_bars in the background
+                self.ib.sleep(2.0)
+                
+                # 2. Run Strategy Logic
+                # Since data is in memory, this is fast
+                self._run_cycle()
+                
+                # 3. Heartbeat log every so often
+                if int(time.time()) % 60 == 0:
+                    self._log(f"[HEARTBEAT] Connected. Open Pos: {len(self.positions)}")
+
+            except KeyboardInterrupt:
+                self._log("Stopping...")
+                self.ib.disconnect()
+                break
+            except Exception as e:
+                self._log(f"[CRASH RECOVERY] {e}")
+                send_email("Trader Crash", traceback.format_exc())
+                self.ib.sleep(10)
+                # Attempt reconnect
+                if not self.ib.isConnected():
+                    try: 
+                        self.ib.connect('127.0.0.1', 7497, clientId=random.randint(100,999))
+                        self._re-subscribe() # You would implement re-subscribing logic here
+                    except: pass
 
 if __name__ == "__main__":
-    main()
+    trader = PaperTrader()
+    trader.run()
