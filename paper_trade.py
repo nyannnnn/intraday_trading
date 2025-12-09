@@ -360,6 +360,9 @@ class PaperTrader:
             
             # Convert to DF (Only need last N bars for features)
             df = self._process_data_to_df(bars[-MAX_BUFFER_LENGTH:])
+            last_close = df['close'].iloc[-1]
+            last_time = df.index[-1]
+            print(f"[{symbol}] Time: {last_time} Price: {last_close}")
             if df.empty: continue
             
             # Check if Data is Fresh (within last 10 mins)
