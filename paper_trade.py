@@ -339,13 +339,18 @@ class PaperTrader:
     def _run_cycle(self):
         """Single iteration of the logic."""
         
-        # 1. Update Portfolio Stats
-        account_summaries = self.ib.accountSummary(tags='NetLiquidation')
-        if account_summaries:
-            current_eq = float(account_summaries[0].value)
-        else:
+        # 1. Update Portfolio Stats (FIXED: Filter manually instead of passing tags)
+        try:
             current_eq = STARTING_EQUITY
-        # (Simplified equity check for speed)
+            summaries = self.ib.accountSummary()
+            if summaries:
+                # Find the tag manually in the list
+                net_liq_obj = next((s for s in summaries if s.tag == 'NetLiquidation'), None)
+                if net_liq_obj:
+                    current_eq = float(net_liq_obj.value)
+        except Exception as e:
+            self._log(f"[ACCT-WARN] Could not read equity: {e}")
+            current_eq = STARTING_EQUITY
         
         # 2. Iterate Universe
         for symbol in UNIVERSE:
