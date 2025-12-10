@@ -32,37 +32,19 @@ try:
         TAKE_PROFIT_PCT,
         MAX_CONCURRENT_POSITIONS,
         DAILY_LOSS_STOP_FRACTION,
-        MAX_BARS_IN_TRADE,
-        COOLDOWN_BARS_AFTER_STOP,
+        RTH_START,
+        RTH_END,
+        RTH_TZ_NAME,
+        MAX_BUFFER_LENGTH,
+        ORDER_WAIT_TIMEOUT_SEC,
+        SMTP_CONFIG,
     )
-    from quant.quant_model import build_features_for_symbol
-    from backtesting import load_latest_classifier
-except ImportError:
-    # --- SAFETY DEFAULTS (For standalone testing) ---
-    print("WARNING: Config not found, using defaults.")
-    UNIVERSE = ['SOFI', 'AAPL']
-    MODEL_DIR = "models"
-    FEATURE_COLUMNS = ['close', 'volume']
-    BAR_INTERVAL_MIN = 5
-    P_UP_ENTRY_THRESHOLD = 0.55
-    RISK_PER_TRADE_FRACTION = 0.01
-    STOP_LOSS_PCT = 0.02
-    TAKE_PROFIT_PCT = 0.04
-    MAX_CONCURRENT_POSITIONS = 3
-    DAILY_LOSS_STOP_FRACTION = 0.02
-    MAX_BARS_IN_TRADE = 24
-    COOLDOWN_BARS_AFTER_STOP = 3
+except Exception as e:
+    raise RuntimeError(f"Failed to import config: {e}")
 
-    def build_features_for_symbol(df):
-        df['f1'] = df['close'].pct_change()
-        return df
+RTH_TZ = ZoneInfo(RTH_TZ_NAME) if RTH_TZ_NAME else None
 
-    class MockClf:
-        def predict_proba(self, X): return np.array([[0.4, 0.6]])
-    def load_latest_classifier(d): return MockClf()
-
-
-# === Logging setup ===
+# === Logging Setup ===
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
@@ -70,57 +52,24 @@ TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
 
 logger = logging.getLogger("paper_trade")
 logger.setLevel(logging.INFO)
+logger.handlers.clear()
 
-# Only add handlers if they don't exist yet to prevent double logging
-if not logger.handlers:
-    file_handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=5)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    )
-    logger.addHandler(file_handler)
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(_console)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    )
-    logger.addHandler(console_handler)
+_file = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3)
+_file.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(_file)
 
-heartbeat_logger = logging.getLogger("paper_trade_heartbeat")
+heartbeat_logger = logging.getLogger("heartbeat")
 heartbeat_logger.setLevel(logging.INFO)
-if not heartbeat_logger.handlers:
-    heartbeat_handler = RotatingFileHandler(
-        os.path.join(LOG_DIR, "paper_trade_heartbeat.log"),
-        maxBytes=1_000_000,
-        backupCount=3,
-    )
-    heartbeat_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    )
-    heartbeat_logger.addHandler(heartbeat_handler)
+heartbeat_logger.handlers.clear()
+hb_file = RotatingFileHandler(os.path.join(LOG_DIR, "heartbeat.log"), maxBytes=500_000, backupCount=2)
+hb_file.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+heartbeat_logger.addHandler(hb_file)
 
-STARTING_EQUITY = 100000.0
-MIN_BARS_FOR_FEATURES = 12
-MAX_BUFFER_LENGTH = 500
-BACKFILL_DURATION_STR = "5 D"
-
-# === Email alert config ===
-ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
-ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
-SMTP_HOST = os.environ.get("TRADER_SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("TRADER_SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("TRADER_SMTP_USER")
-SMTP_PASS = os.environ.get("TRADER_SMTP_PASS")
-
-# === Trading Hours ===
-RTH_START = dt.time(9, 0)
-RTH_END = dt.time(16, 30)
-US_EQUITY_OPEN = dt.time(9, 30)
-US_EQUITY_OPEN_WARMUP_END = dt.time(9, 45)
-
-try:
-    RTH_TZ = ZoneInfo("America/New_York")
-except Exception:
-    RTH_TZ = None
+STARTING_EQUITY = 100_000.0
 
 HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
 
@@ -138,50 +87,27 @@ def minutes_until_next_rth_open() -> float:
         now = dt.datetime.now(RTH_TZ)
     else:
         now = dt.datetime.now()
-
-    current_time = now.time()
-    if current_time < RTH_START:
-        target_date = now.date()
-    else:
-        target_date = now.date() + dt.timedelta(days=1)
-
+    today_open = dt.datetime.combine(now.date(), RTH_START)
     if RTH_TZ is not None:
-        target_dt = dt.datetime.combine(target_date, RTH_START, tzinfo=RTH_TZ)
-    else:
-        target_dt = dt.datetime.combine(target_date, RTH_START)
-
-    delta = target_dt - now
+        today_open = today_open.replace(tzinfo=RTH_TZ)
+    if now <= today_open:
+        delta = today_open - now
+        return max(delta.total_seconds() / 60.0, 0.0)
+    tomorrow = now.date() + dt.timedelta(days=1)
+    next_open = dt.datetime.combine(tomorrow, RTH_START)
+    if RTH_TZ is not None:
+        next_open = next_open.replace(tzinfo=RTH_TZ)
+    delta = next_open - now
     return max(delta.total_seconds() / 60.0, 0.0)
-
-
-def send_fatal_error_email(subject: str, body: str) -> None:
-    if not ALERT_EMAIL_TO:
-        return
-    from_addr = ALERT_EMAIL_FROM or ALERT_EMAIL_TO
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = ALERT_EMAIL_TO
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            if SMTP_USER and SMTP_PASS:
-                server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-        logger.info(f"[ALERT] Sent fatal error email to {ALERT_EMAIL_TO}.")
-    except Exception as e:
-        logger.error(f"[ALERT-ERROR] Failed to send fatal error email: {e}")
 
 
 @dataclass
 class Position:
+    """Single open long position with entry, size, and risk levels."""
     symbol: str
     size: int
     entry_price: float
     entry_dt: pd.Timestamp
-    stop_price: float
-    take_profit_price: float
-    p_up: float
 
 
 class PaperTrader:
@@ -196,27 +122,67 @@ class PaperTrader:
         self.last_stop_bar: Dict[str, pd.Timestamp] = {}
         self.trades_today: list[dict] = []
         self.current_trading_date: Optional[dt.date] = None
+        self.closed_trade_keys: set[tuple] = set()  # tracks already-closed trades
 
     @staticmethod
     def _log(msg: str) -> None:
         logger.info(msg)
 
+    def _send_email_alert(self, subject: str, body: str) -> None:
+        if not SMTP_CONFIG:
+            return
+        try:
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = SMTP_CONFIG["from_addr"]
+            msg["To"] = SMTP_CONFIG["to_addr"]
+
+            with smtplib.SMTP(SMTP_CONFIG["host"], SMTP_CONFIG["port"]) as server:
+                if SMTP_CONFIG.get("use_tls", False):
+                    server.starttls()
+                if SMTP_CONFIG.get("username"):
+                    server.login(SMTP_CONFIG["username"], SMTP_CONFIG["password"])
+                server.send_message(msg)
+        except Exception as e:
+            self._log(f"[EMAIL-ERROR] Failed to send email: {e}")
+
     def _append_trade_to_csv(self, trade_record: dict) -> None:
+        """Append a single trade to trades CSV, skipping duplicates by key."""
         os.makedirs(LOG_DIR, exist_ok=True)
         file_exists = os.path.exists(TRADES_CSV_PATH)
         fieldnames = [
             "symbol", "entry_dt", "exit_dt", "entry_price", "exit_price",
-            "size", "pnl", "r_multiple", "reason"
+            "size", "pnl", "r_multiple", "reason",
         ]
+
         rec = dict(trade_record)
         entry_dt = rec.get("entry_dt")
         exit_dt = rec.get("exit_dt")
 
+        # Normalize timestamps to ISO strings for stable comparison
         if isinstance(entry_dt, (pd.Timestamp, dt.datetime)):
             rec["entry_dt"] = entry_dt.isoformat()
         if isinstance(exit_dt, (pd.Timestamp, dt.datetime)):
             rec["exit_dt"] = exit_dt.isoformat()
 
+        # Build a simple fingerprint for duplicate detection
+        key_fields = ("symbol", "entry_dt", "entry_price", "exit_price", "size", "reason")
+        new_key = tuple(str(rec.get(k, "")) for k in key_fields)
+
+        # 1) If file exists, scan to avoid duplicate rows
+        if file_exists:
+            try:
+                with open(TRADES_CSV_PATH, newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        existing_key = tuple(str(row.get(k, "")) for k in key_fields)
+                        if existing_key == new_key:
+                            self._log(f"[TRADE-LOG-SKIP] Duplicate trade detected for {rec['symbol']}, not appending to CSV.")
+                            return
+            except Exception as e:
+                self._log(f"[TRADE-LOG-ERROR] Failed to check CSV for duplicates: {e}")
+
+        # 2) Append new row
         try:
             with open(TRADES_CSV_PATH, "a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -245,27 +211,24 @@ class PaperTrader:
         if RTH_TZ is None:
             return False
         local = now_ts.tz_convert(RTH_TZ)
-        t = local.time()
-        return US_EQUITY_OPEN <= t < US_EQUITY_OPEN_WARMUP_END
-
-    def _ib_net_liquidation(self) -> Optional[float]:
-        if self.ib is None:
-            return None
-        try:
-            accs = self.ib.accountSummary()
-            for row in accs:
-                if row.tag == "NetLiquidation":
-                    return float(row.value)
-        except Exception as e:
-            self._log(f"[IB] Failed to fetch NetLiquidation: {e}")
-        return None
+        open_dt = dt.datetime.combine(local.date(), RTH_START).replace(tzinfo=RTH_TZ)
+        return dt.timedelta(0) <= (local - open_dt) <= dt.timedelta(minutes=30)
 
     def _current_equity(self) -> float:
-        return self.start_of_day_equity + self.realized_pnl_today
+        try:
+            if self.ib is None or not self.ib.isConnected():
+                return self.start_of_day_equity
+            acc_vals = self.ib.accountValues()
+            for v in acc_vals:
+                if v.tag == "NetLiquidation":
+                    return float(v.value)
+        except Exception as e:
+            self._log(f"[EQUITY-ERROR] {e}")
+        return self.start_of_day_equity
 
-    def _max_daily_loss_reached(self) -> bool:
-        equity_now = self._current_equity()
-        drop = (equity_now - self.start_of_day_equity) / self.start_of_day_equity
+    def _daily_loss_limit_hit(self) -> bool:
+        eq = self._current_equity()
+        drop = (eq - self.start_of_day_equity) / max(self.start_of_day_equity, 1.0)
         return drop <= -DAILY_LOSS_STOP_FRACTION
 
     def _calc_position_size(self, price: float) -> int:
@@ -282,248 +245,231 @@ class PaperTrader:
     def _position_risk_ok(self, symbol: str, bar_time: pd.Timestamp) -> bool:
         if symbol in self.positions:
             return False
-        if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
+        if self._daily_loss_limit_hit():
+            self._log("[RISK] Daily loss limit hit, not opening new positions.")
             return False
-        last_stop = self.last_stop_bar.get(symbol)
-        if last_stop is not None:
-            bars_since_stop = (bar_time - last_stop) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
-            if bars_since_stop < COOLDOWN_BARS_AFTER_STOP:
-                self._log(f"[COOLDOWN] Skipping {symbol}: {bars_since_stop:.1f} bars since STOP.")
+
+        if RTH_TZ is not None:
+            local = bar_time.tz_convert(RTH_TZ)
+            if local.time() >= (dt.datetime.combine(local.date(), RTH_END) - dt.timedelta(minutes=10)).time():
+                self._log(f"[RISK] Skipping entries near close for {symbol}.")
                 return False
-        if self._max_daily_loss_reached():
-            self._log("[DAILY-STOP] Daily loss limit reached; no new entries.")
+
+        if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
+            self._log(f"[RISK] Max concurrent positions reached ({MAX_CONCURRENT_POSITIONS})")
             return False
+
+        last_stop_ts = self.last_stop_bar.get(symbol)
+        if last_stop_ts is not None:
+            if (bar_time - last_stop_ts) < dt.timedelta(minutes=BAR_INTERVAL_MIN * 3):
+                self._log(f"[RISK] {symbol} in cooldown after STOP.")
+                return False
+
         return True
 
-    @staticmethod
-    def _empty_buffer() -> pd.DataFrame:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"], dtype=float)
+    def _empty_buffer(self) -> pd.DataFrame:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
-    def _update_buffer_from_bars(self, symbol: str, bars: list) -> Optional[pd.Series]:
-        if not bars:
-            return None
-        last_bar = bars[-1]
-        ts = self._normalize_ts(last_bar.date)
-        row = {
-            "open": last_bar.open, "high": last_bar.high, "low": last_bar.low,
-            "close": last_bar.close, "volume": last_bar.volume,
-        }
-        buf = self.ohlcv_buffers.get(symbol)
-        if buf is None or buf.empty:
-            buf = self._empty_buffer()
-        buf.loc[ts] = row
-        if len(buf) > MAX_BUFFER_LENGTH:
-            buf = buf.iloc[-MAX_BUFFER_LENGTH:]
-        self.ohlcv_buffers[symbol] = buf
-        return buf.iloc[-1]
-
-    def _backfill_buffers_on_startup(self) -> None:
-        if self.ib is None or not self.ib.isConnected():
-            return
-        self._log(f"[BACKFILL] Requesting {BACKFILL_DURATION_STR} of {BAR_INTERVAL_MIN}-min RTH bars...")
-        for sym in UNIVERSE:
-            # === STARTUP PACE LIMITER ===
-            self.ib.sleep(1.0)
-            
-            contract = self.contracts[sym]
-            try:
-                bars = self.ib.reqHistoricalData(
-                    contract, endDateTime="", durationStr=BACKFILL_DURATION_STR,
-                    barSizeSetting=f"{BAR_INTERVAL_MIN} mins", whatToShow="TRADES",
-                    useRTH=True, formatDate=1,
-                )
-            except Exception as e:
-                self._log(f"[BACKFILL-ERROR] {sym}: {e}")
-                continue
-            if not bars:
-                continue
-            data = []
-            for b in bars:
-                ts = self._normalize_ts(b.date)
-                data.append({
-                    "datetime": ts, "open": b.open, "high": b.high,
-                    "low": b.low, "close": b.close, "volume": b.volume,
-                })
-            df = pd.DataFrame(data).set_index("datetime").sort_index()
-            if len(df) > MAX_BUFFER_LENGTH:
-                df = df.iloc[-MAX_BUFFER_LENGTH:]
-            self.ohlcv_buffers[sym] = df
-            self._log(f"[BACKFILL] {sym}: loaded {len(df)} bars.")
-
-    def _connect_ib_and_setup(self) -> None:
-        self._log("Connecting to IBKR TWS/Gateway...")
+    def connect_and_load(self) -> None:
         self.ib = IB()
-        max_retries = 5
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, 6):
             try:
+                self._log(f"Connecting to IBKR TWS/Gateway... attempt {attempt}")
                 self.ib.connect("127.0.0.1", 7497, clientId=1)
-                if self.ib.isConnected():
-                    self._log(f"Connected to IBKR on attempt {attempt}.")
-                    break
+                self._log(f"Connected to IBKR on attempt {attempt}.")
+                break
             except Exception as e:
-                self._log(f"Connection error (attempt {attempt}): {e}")
-            if attempt < max_retries:
+                self._log(f"IBKR connection attempt {attempt} failed: {e}")
                 time.sleep(5)
         else:
-            raise RuntimeError("Could not connect to IBKR.")
+            raise RuntimeError("Could not connect to IBKR after multiple attempts.")
 
-        self._log(f"Using internal STARTING_EQUITY={self.start_of_day_equity:.2f}")
-        net_liq = self._ib_net_liquidation()
-        if net_liq:
-            self._log(f"[INFO] IBKR NetLiquidation={net_liq:.2f} (monitoring only)")
+        self._log("Fetching IBKR NetLiquidation for starting equity...")
+        try:
+            acc_vals = self.ib.accountValues()
+            for v in acc_vals:
+                if v.tag == "NetLiquidation":
+                    self.start_of_day_equity = float(v.value)
+                    break
+            self._log(f"Start-of-day equity from IBKR NetLiquidation: {self.start_of_day_equity:.2f}")
+        except Exception as e:
+            self._log(f"[WARN] Could not fetch NetLiquidation, using default {STARTING_EQUITY:.2f}: {e}")
 
         self._log("Loading latest classifier...")
+        from backtesting import load_latest_classifier
+
         self.clf = load_latest_classifier(MODEL_DIR)
+        self._log("Classifier loaded.")
+
         self._log(f"Creating contracts for universe: {UNIVERSE}")
         for sym in UNIVERSE:
             self.contracts[sym] = Stock(sym, "SMART", "USD")
         self._log("Qualifying contracts...")
         self.ib.qualifyContracts(*self.contracts.values())
-        
+
         self._log("Initializing buffers...")
         for sym in UNIVERSE:
             self.ohlcv_buffers[sym] = self._empty_buffer()
         self._backfill_buffers_on_startup()
 
     def _ensure_ib_connected(self) -> bool:
-        if self.ib is None: return False
-        if self.ib.isConnected(): return True
-        self._log("[IB] Connection lost; attempting reconnect...")
+        if self.ib is None:
+            return False
+        if self.ib.isConnected():
+            return True
+
         try:
-            try: self.ib.disconnect()
-            except Exception: pass
+            self._log("[IB] Disconnected, trying to reconnect...")
             self.ib.connect("127.0.0.1", 7497, clientId=1)
             if self.ib.isConnected():
-                self._log("[IB] Reconnected.")
+                self._log("[IB] Reconnected successfully.")
                 return True
         except Exception as e:
-            self._log(f"[IB] Reconnect failed: {e}")
+            self._log(f"[IB-ERROR] Reconnect failed: {e}")
         return False
 
-    def connect_and_load(self) -> None:
-        self._connect_ib_and_setup()
+    def _backfill_symbol(self, symbol: str, end_dt: dt.datetime, bars: int = MAX_BUFFER_LENGTH) -> None:
+        contract = self.contracts[symbol]
+        duration = f"{bars * BAR_INTERVAL_MIN} M"
+        bar_size = f"{BAR_INTERVAL_MIN} mins"
 
-    def _load_existing_ib_positions(self) -> None:
-        """
-        Seed positions from IBKR portfolio.
-        If a position has no existing brackets (is naked), automatically attach 'Rescue' orders.
-        """
-        if self.ib is None or not self.ib.isConnected():
+        self._log(f"[BACKFILL] {symbol}: requesting {duration} of {bar_size} ending {end_dt}.")
+        bars_data = self.ib.reqHistoricalData(
+            contract,
+            endDateTime=end_dt,
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        if not bars_data:
+            self._log(f"[BACKFILL] {symbol}: no data returned.")
             return
 
+        rows = []
+        for b in bars_data:
+            rows.append(
+                {
+                    "datetime": self._normalize_ts(pd.Timestamp(b.date)),
+                    "open": b.open,
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.volume,
+                }
+            )
+        df = pd.DataFrame(rows).set_index("datetime")
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        self.ohlcv_buffers[symbol] = df.tail(MAX_BUFFER_LENGTH)
+        self._log(f"[BACKFILL] {symbol}: buffer now {len(df)} rows.")
+
+    def _backfill_buffers_on_startup(self) -> None:
+        now = dt.datetime.utcnow()
+        for sym in UNIVERSE:
+            try:
+                self._backfill_symbol(sym, now)
+            except Exception as e:
+                self._log(f"[BACKFILL-ERROR] {sym}: {e}")
+
+    def _load_existing_ib_positions(self) -> None:
+        if self.ib is None:
+            return
         try:
-            # 1. Get actual held positions
-            ib_positions = self.ib.positions()
-            
-            # 2. Get Open Trades (using openTrades to link Order+Contract)
-            self.ib.reqAllOpenOrders()
-            open_trades = self.ib.openTrades()
-            
-            for p in ib_positions:
-                sym = p.contract.symbol
-                if sym not in UNIVERSE:
-                    continue
-                
-                pos_size = int(p.position)
-                if pos_size == 0:
-                    continue
-
-                avg_cost = float(p.avgCost or 0.0)
-                stop_price = 0.0
-                tp_price = 0.0
-                
-                # --- Scan for existing orders ---
-                relevant_trades = [
-                    t for t in open_trades 
-                    if t.contract.symbol == sym and t.order.action == 'SELL'
-                ]
-
-                for t in relevant_trades:
-                    order = t.order
-                    if order.orderType in ['STP', 'TRAIL']:
-                        stop_price = order.auxPrice
-                    elif order.orderType == 'LMT':
-                        # Assume Limit Sell above cost is TP
-                        if order.lmtPrice > avg_cost:
-                            tp_price = order.lmtPrice
-
-                # --- RESCUE LOGIC: If Naked, Protect It ---
-                if stop_price == 0 and tp_price == 0:
-                    self._log(f"[RESCUE] {sym} is NAKED. Attaching new Hard Bracket...")
-                    
-                    new_sl = round(avg_cost * (1.0 - STOP_LOSS_PCT), 2)
-                    new_tp = round(avg_cost * (1.0 + TAKE_PROFIT_PCT), 2)
-                    
-                    oca_group_name = f"RESCUE_{sym}_{int(time.time())}"
-                    
-                    # FIX: Explicit TIF='DAY' to avoid 10349 Preset Error
-                    sl_order = StopOrder('SELL', pos_size, new_sl)
-                    sl_order.ocaGroup = oca_group_name
-                    sl_order.ocaType = 1 
-                    sl_order.tif = 'DAY'
-                    
-                    tp_order = LimitOrder('SELL', pos_size, new_tp)
-                    tp_order.ocaGroup = oca_group_name
-                    tp_order.ocaType = 1
-                    tp_order.tif = 'DAY'
-
-                    # FIX: Use SMART contract to avoid Direct Routing errors
-                    contract_smart = self.contracts.get(sym)
-                    if not contract_smart:
-                        contract_smart = Stock(sym, 'SMART', 'USD')
-                        self.ib.qualifyContracts(contract_smart)
-
-                    self.ib.placeOrder(contract_smart, sl_order)
-                    self.ib.placeOrder(contract_smart, tp_order)
-                    
-                    stop_price = new_sl
-                    tp_price = new_tp
-                    self._log(f"[RESCUE-SENT] {sym}: SL={new_sl}, TP={new_tp} (Sent to SMART)")
-
-                # --- Log Status ---
-                log_msg = f"[EXISTING] {sym} size={pos_size} @ {avg_cost:.2f}."
-                if stop_price > 0:
-                    log_msg += f" SL={stop_price:.2f}"
-                if tp_price > 0:
-                    log_msg += f" TP={tp_price:.2f}"
-                self._log(log_msg)
-
-                # Reconstruct Position object
-                self.positions[sym] = Position(
-                    symbol=sym,
-                    size=pos_size,
-                    entry_price=avg_cost,
-                    entry_dt=self._ib_now(), 
-                    stop_price=stop_price,
-                    take_profit_price=tp_price,
-                    p_up=0.0 
-                )
-
+            open_positions = self.ib.positions()
         except Exception as e:
-            self._log(f"[IB] Failed to load/rescue positions: {e}")
-            logger.error(traceback.format_exc())
+            self._log(f"[IB-POSITIONS-ERROR] {e}")
+            return
+
+        if not open_positions:
+            self._log("[RESCUE] No existing IBKR positions at startup.")
+            return
+
+        for p in open_positions:
+            sym = p.contract.symbol
+            if sym not in UNIVERSE:
+                continue
+            avg_price = float(p.avgCost)
+            size = int(p.position)
+            if size == 0:
+                continue
+            pos = Position(
+                symbol=sym,
+                size=size,
+                entry_price=avg_price,
+                entry_dt=self._ib_now(),
+            )
+            self.positions[sym] = pos
+            self._log(f"[RESCUE] {sym}: restored position size={size} entry_price={avg_price:.4f}")
+
+    def _poll_bars_once(self) -> None:
+        if not self._ensure_ib_connected():
+            raise RuntimeError("IB connection lost and could not reconnect.")
+        now_ts = self._ib_now()
+        self._maybe_roll_trading_date(now_ts)
+
+        for sym in UNIVERSE:
+            try:
+                self._poll_symbol(sym)
+            except Exception as e:
+                self._log(f"[POLL-ERROR] {sym}: {e}")
+
+    def _poll_symbol(self, symbol: str) -> None:
+        contract = self.contracts[symbol]
+        bars = self.ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=f"{BAR_INTERVAL_MIN} M",
+            barSizeSetting=f"{BAR_INTERVAL_MIN} mins",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        if not bars:
+            return
+
+        b = bars[-1]
+        bar_ts = self._normalize_ts(pd.Timestamp(b.date))
+        buf = self.ohlcv_buffers[symbol]
+        if bar_ts in buf.index:
+            return
+
+        new_row = pd.DataFrame(
+            {
+                "open": [b.open],
+                "high": [b.high],
+                "low": [b.low],
+                "close": [b.close],
+                "volume": [b.volume],
+            },
+            index=[bar_ts],
+        )
+        buf = pd.concat([buf, new_row])
+        buf = buf[~buf.index.duplicated(keep="last")].sort_index()
+        self.ohlcv_buffers[symbol] = buf.tail(MAX_BUFFER_LENGTH)
+
+        if bar_ts.tzinfo is None:
+            self._log(f"[WARN] Bar {symbol} has no tzinfo: {bar_ts}")
+        self._maybe_enter_or_manage(symbol, bar_ts)
 
     def _submit_market_order(self, symbol: str, size: int) -> Optional[SimpleNamespace]:
-        # Used for closing only
         contract = self.contracts[symbol]
         action = "BUY" if size > 0 else "SELL"
-        self._log(f"[ORDER] Submitting {action} {abs(size)} {symbol} (MKT)...")
         order = MarketOrder(action, abs(size))
-        # FIX: Explicit TIF='DAY'
-        order.tif = 'DAY'
-        
         trade = self.ib.placeOrder(contract, order)
-        self.ib.sleep(1)
+        self._log(f"[ORDER] {action} {abs(size)} {symbol} as market order submitted.")
+
         elapsed = 0.0
-        while not trade.isDone() and elapsed < 15.0:
-            self.ib.sleep(0.5)
+        while not trade.isDone() and elapsed < ORDER_WAIT_TIMEOUT_SEC:
+            self.ib.waitOnUpdate(timeout=1)
             elapsed += 0.5
         fills = trade.fills
         if not fills:
             self._log("[ORDER] No fills received.")
             return None
         total_shares = sum(abs(f.execution.shares) for f in fills)
-        if total_shares == 0: return None
+        if total_shares == 0:
+            return None
         avg_price = sum(f.execution.price * abs(f.execution.shares) for f in fills) / total_shares
         self._log(f"[ORDER-FILLED] {action} {abs(size)} {symbol} avg={avg_price:.4f}")
         return SimpleNamespace(avg_price=avg_price, size=size, action=action, raw_trade=trade)
@@ -533,49 +479,126 @@ class PaperTrader:
         stop_price = round(current_price * (1.0 - STOP_LOSS_PCT), 2)
         tp_price = round(current_price * (1.0 + TAKE_PROFIT_PCT), 2)
 
-        # 1. Parent Market Order
-        parent = MarketOrder('BUY', size)
-        parent.transmit = False 
-        parent.tif = 'DAY' # FIX: Explicit TIF
-        
-        # 2. Take Profit
-        takeProfit = LimitOrder('SELL', size, tp_price)
-        takeProfit.transmit = False
-        takeProfit.tif = 'DAY' # FIX: Explicit TIF
-        
-        # 3. Stop Loss
-        stopLoss = StopOrder('SELL', size, stop_price)
-        stopLoss.transmit = True 
-        stopLoss.tif = 'DAY' # FIX: Explicit TIF
+        parent = LimitOrder("BUY", size, current_price, transmit=False)
+        parent.orderType = "MKT"
+        parent.tif = "DAY"
 
-        # Linking
-        parent.orderId = self.ib.client.getReqId()
-        takeProfit.parentId = parent.orderId
-        stopLoss.parentId = parent.orderId
-        
-        self.ib.placeOrder(contract, parent)
-        self.ib.placeOrder(contract, takeProfit)
-        self.ib.placeOrder(contract, stopLoss)
-        
-        self.ib.sleep(0.5)
-        entry_price = current_price 
+        take_profit = LimitOrder("SELL", size, tp_price, parentId=parent.orderId, transmit=False)
+        stop_loss = StopOrder("SELL", size, stop_price, parentId=parent.orderId, transmit=True)
 
-        self.positions[symbol] = Position(
-            symbol=symbol, size=size, entry_price=entry_price, entry_dt=bar_time,
-            stop_price=stop_price, take_profit_price=tp_price, p_up=p_up
+        self.ib.qualifyContracts(contract)
+        trade_parent = self.ib.placeOrder(contract, parent)
+        trade_tp = self.ib.placeOrder(contract, take_profit)
+        trade_sl = self.ib.placeOrder(contract, stop_loss)
+
+        self._log(
+            f"[ENTRY-BRACKET] {symbol} sent. Size={size} EstPrice={current_price:.2f} "
+            f"SL={stop_price} TP={tp_price} p_up={p_up:.3f}"
         )
-        self._log(f"[ENTRY-BRACKET] {symbol} sent. Size={size} EstPrice={current_price:.2f} SL={stop_price} TP={tp_price}")
+
+        return SimpleNamespace(
+            parent=trade_parent,
+            take_profit=trade_tp,
+            stop_loss=trade_sl,
+            stop_price=stop_price,
+            take_profit_price=tp_price,
+            p_up=p_up,
+        )
+
+    def _maybe_enter_or_manage(self, symbol: str, bar_time: pd.Timestamp) -> None:
+        from quant_model import build_features_for_symbol
+
+        buf = self.ohlcv_buffers[symbol]
+        if len(buf) < 20:
+            return
+
+        now = bar_time
+        if not is_rth_now():
+            return
+
+        if self._daily_loss_limit_hit():
+            return
+
+        from quant_model import build_features_for_symbol as build_features_for_symbol_internal
+
+        try:
+            panel = build_features_for_symbol_internal(buf)
+        except Exception as e:
+            self._log(f"[FEATURE-ERROR] {symbol}: {e}")
+            return
+
+        if panel.empty:
+            return
+
+        row = panel.iloc[-1]
+        feat_vals = row[FEATURE_COLUMNS]
+        if not np.isfinite(feat_vals.values.astype(float)).all():
+            return
+
+        x = feat_vals.to_frame().T
+        p_up = float(self.clf.predict_proba(x)[0, 1])
+
+        if p_up > 0.5:
+            self._log(f"[SIGNAL] {symbol}: p_up={p_up:.3f}")
+
+        if symbol not in self.positions:
+            if p_up < P_UP_ENTRY_THRESHOLD:
+                return
+            if not self._position_risk_ok(symbol, bar_time):
+                return
+
+            current_price = float(buf["close"].iloc[-1])
+            size = self._calc_position_size(current_price)
+            if size <= 0:
+                return
+
+            bracket = self._place_bracket_order(symbol, size, p_up, current_price, bar_time)
+            pos = Position(
+                symbol=symbol,
+                size=size,
+                entry_price=current_price,
+                entry_dt=bar_time,
+            )
+            self.positions[symbol] = pos
+            self._log(
+                f"[POSITION-OPEN] {symbol}: size={size}, entry={current_price:.4f}, "
+                f"SL={bracket.stop_price}, TP={bracket.take_profit_price}"
+            )
+            return
+
+        pos = self.positions[symbol]
+        stop_price = pos.entry_price * (1.0 - STOP_LOSS_PCT)
+        tp_price = pos.entry_price * (1.0 + TAKE_PROFIT_PCT)
+
+        current_price = float(buf["close"].iloc[-1])
+        if current_price <= stop_price:
+            self._log(f"[STOP-HIT] {symbol} at price {current_price:.4f}")
+            self._close_position(symbol, pos, current_price, bar_time, reason="STOP")
+        elif current_price >= tp_price:
+            self._log(f"[TAKE-PROFIT] {symbol} at price {current_price:.4f}")
+            self._close_position(symbol, pos, current_price, bar_time, reason="TAKE_PROFIT")
 
     def _close_position(self, symbol: str, pos: Position, exit_price: float, exit_ts: pd.Timestamp, reason: str) -> None:
         """
-        Close a position, cancel any pending orders, and log the result.
+        Close a position once (idempotent), cancel any pending orders, and log the result.
         """
-        # 1. Cancel any open orders for this symbol (Cleanup bracket children)
-        # FIX: Use openTrades() to verify symbol
+        # --- 0) Idempotency guard: skip if we've already closed this economic trade ---
+        trade_key = (
+            symbol,
+            float(pos.entry_price),
+            pos.entry_dt.isoformat() if hasattr(pos.entry_dt, "isoformat") else str(pos.entry_dt),
+            int(pos.size),
+        )
+        if trade_key in self.closed_trade_keys:
+            self._log(f"[EXIT-SKIP] {symbol}: trade already closed, skipping duplicate.")
+            return
+        self.closed_trade_keys.add(trade_key)
+
+        # 1. Cancel any open orders for this symbol (cleanup bracket children)
         for t in self.ib.openTrades():
             if t.contract.symbol == symbol:
                 self.ib.cancelOrder(t.order)
-        
+
         # 2. If the exit reason is NOT 'BRACKET_HIT', we need to send a market sell.
         if reason != "BRACKET_HIT":
             size = pos.size
@@ -587,24 +610,30 @@ class PaperTrader:
         else:
             realized_price = exit_price
 
-        # 3. Calculate PnL
+        # 3. Calculate PnL (R-multiple based on fixed % stop distance)
         realized = (realized_price - pos.entry_price) * pos.size
         r_multiple = realized / (STOP_LOSS_PCT * pos.entry_price * pos.size)
         self.realized_pnl_today += realized
 
         if reason == "STOP":
             self.last_stop_bar[symbol] = exit_ts
-            
-        # 4. Log & Record
+
+        # 4. Log & record trade
         trade_record = {
-            "symbol": symbol, "entry_dt": pos.entry_dt, "exit_dt": exit_ts,
-            "entry_price": pos.entry_price, "exit_price": realized_price,
-            "size": pos.size, "pnl": realized, "r_multiple": r_multiple, "reason": reason,
+            "symbol": symbol,
+            "entry_dt": pos.entry_dt,
+            "exit_dt": exit_ts,
+            "entry_price": pos.entry_price,
+            "exit_price": realized_price,
+            "size": pos.size,
+            "pnl": realized,
+            "r_multiple": r_multiple,
+            "reason": reason,
         }
         self.trades_today.append(trade_record)
         self._append_trade_to_csv(trade_record)
         self._log(f"[EXIT-{reason}] {symbol}: pnl={realized:.2f}, R={r_multiple:.2f}")
-        
+
         # 5. Remove from local tracking
         if symbol in self.positions:
             del self.positions[symbol]
@@ -627,107 +656,68 @@ class PaperTrader:
             self._log("[SUMMARY] No trades today.")
             return
         total_pnl = sum(t["pnl"] for t in self.trades_today)
-        self._log(f"[SUMMARY] PnL={total_pnl:.2f}, Trades={len(self.trades_today)}")
+        avg_pnl = total_pnl / max(len(self.trades_today), 1)
+        self._log(f"[SUMMARY] Trades={len(self.trades_today)} TotalPnL={total_pnl:.2f} AvgPnL={avg_pnl:.2f}")
 
-    def _poll_bars_once(self) -> None:
-        now_ts = self._ib_now()
-        self._maybe_roll_trading_date(now_ts)
-
-        # 1. Fetch Bars
-        for sym in UNIVERSE:
-            # === PACE LIMITER ===
-            self.ib.sleep(1.0) 
-            
-            contract = self.contracts[sym]
-            try:
-                bars = self.ib.reqHistoricalData(
-                    contract, endDateTime="", durationStr=f"{BAR_INTERVAL_MIN * 2} M",
-                    barSizeSetting=f"{BAR_INTERVAL_MIN} mins", whatToShow="TRADES",
-                    useRTH=True, formatDate=1,
-                )
-            except Exception:
-                continue
-            if not bars: continue
-            last = self._update_buffer_from_bars(sym, bars)
-            if last is None: continue
-
-        # 2. Check Exits (IBKR brackets handle exits, but we monitor for logging)
-        for sym, pos in list(self.positions.items()):
-            ib_positions = {p.contract.symbol: p.position for p in self.ib.positions()}
-            # If position is gone, Bracket was hit
-            if sym not in ib_positions or ib_positions[sym] == 0:
-                self._log(f"[EXIT-DETECTED] {sym} no longer in portfolio (Bracket hit?).")
-                buf = self.ohlcv_buffers.get(sym)
-                close = buf.iloc[-1]['close'] if buf is not None else pos.entry_price
-                self._close_position(sym, pos, close, now_ts, "BRACKET_HIT")
-                continue
-            
-            # Time Stop Check
-            buf = self.ohlcv_buffers.get(sym)
-            if buf is None or buf.empty: continue
-            last_ts = buf.index[-1]
-            bars_held = (last_ts - pos.entry_dt) / dt.timedelta(minutes=BAR_INTERVAL_MIN)
-            if bars_held >= MAX_BARS_IN_TRADE:
-                self._log(f"[EXIT-CHECK] {sym}: MAX_BARS hit.")
-                self._close_position(sym, pos, buf.iloc[-1]['close'], last_ts, "MAX_BARS")
-
-        # 3. Check Entries
-        if self._max_daily_loss_reached(): return
-        if self._is_within_open_warmup(now_ts): return
-
-        for sym in UNIVERSE:
-            if sym in self.positions: continue
-            buf = self.ohlcv_buffers.get(sym)
-            if buf is None or len(buf) < MIN_BARS_FOR_FEATURES: continue
-            
-            panel = build_features_for_symbol(buf)
-            if panel.empty: continue
-            
-            row = panel.iloc[-1]
-            feat_vals = row[FEATURE_COLUMNS]
-            if ~np.isfinite(feat_vals.values.astype(float)).all():
-                continue
-
-            x = feat_vals.to_frame().T
-            p_up = float(self.clf.predict_proba(x)[0, 1])
-
-            if p_up > 0.5:
-                self._log(f"[SIGNAL] {sym}: p_up={p_up:.3f}")
-
-            if p_up < P_UP_ENTRY_THRESHOLD: continue
-            if not self._position_risk_ok(sym, buf.index[-1]): continue
-
-            price = float(row["close"])
-            size = self._calc_position_size(price)
-            if size <= 0: continue
-
-            # USE BRACKET ENTRY
-            self._place_bracket_order(sym, size, p_up, price, buf.index[-1])
+        body_lines = [
+            f"Date: {self.current_trading_date}",
+            f"Start-of-day equity: {self.start_of_day_equity:.2f}",
+            f"Realized PnL today: {self.realized_pnl_today:.2f}",
+            f"Number of trades: {len(self.trades_today)}",
+            "",
+            "Trades:",
+        ]
+        for t in self.trades_today:
+            body_lines.append(
+                f"{t['symbol']} {t['entry_dt']} -> {t['exit_dt']} "
+                f"pnl={t['pnl']:.2f} R={t['r_multiple']:.2f} reason={t['reason']}"
+            )
+        body = "\n".join(body_lines)
+        self._send_email_alert(
+            subject=f"Paper Trade Summary {self.current_trading_date}",
+            body=body,
+        )
 
     def _log_open_positions(self) -> None:
+        """Log open positions using last bar close as mark price for open PnL."""
         if not self.positions:
             self._log("[POSITIONS] None")
+            return
+
         for sym, pos in self.positions.items():
-            self._log(f"[POSITIONS] {sym}: size={pos.size}, pnl={(pos.entry_price*pos.size):.2f}")
+            buf = self.ohlcv_buffers.get(sym)
+            if buf is not None and not buf.empty:
+                last_price = float(buf["close"].iloc[-1])
+            else:
+                # Fallback: no recent bar, assume flat PnL
+                last_price = float(pos.entry_price)
+
+            open_pnl = (last_price - pos.entry_price) * pos.size
+            self._log(
+                f"[POSITIONS] {sym}: size={pos.size}, last={last_price:.2f}, open_pnl={open_pnl:.2f}"
+            )
 
     def run(self) -> None:
         self._log("Initializing paper trader...")
         self.connect_and_load()
         self._load_existing_ib_positions()
         self._log("Starting polling loop...")
-        
+
         while True:
             if not is_rth_now():
                 min_to_open = minutes_until_next_rth_open()
                 sleep_min = min(min_to_open, HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH)
                 sleep_min = max(1.0, sleep_min)
                 heartbeat_logger.info(f"[HEARTBEAT] Outside RTH. Sleeping {sleep_min:.1f} min.")
-                if self.ib and self.ib.isConnected(): self.ib.sleep(sleep_min * 60)
-                else: time.sleep(sleep_min * 60)
+                if self.ib and self.ib.isConnected():
+                    self.ib.sleep(sleep_min * 60)
+                else:
+                    time.sleep(sleep_min * 60)
                 continue
 
             if not self._ensure_ib_connected():
-                time.sleep(15)
+                heartbeat_logger.info("[HEARTBEAT] IB disconnected, retrying in 60s.")
+                time.sleep(60)
                 continue
 
             start = dt.datetime.now()
@@ -748,11 +738,11 @@ def main() -> None:
     try:
         trader.run()
     except KeyboardInterrupt:
-        logger.info("Manual Stop.")
+        trader._log("Shutting down due to KeyboardInterrupt.")
     except Exception as e:
-        logger.error(f"[FATAL] {e}")
-        send_fatal_error_email("Paper Trader Crashed", traceback.format_exc())
-        raise
+        trader._log(f"[FATAL] {e}")
+        trader._log(traceback.format_exc())
+
 
 if __name__ == "__main__":
     main()
