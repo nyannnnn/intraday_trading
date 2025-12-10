@@ -381,8 +381,13 @@ class PaperTrader:
 
     def _backfill_symbol(self, symbol: str, end_dt: dt.datetime, bars: int = MAX_BUFFER_LENGTH) -> None:
         contract = self.contracts[symbol]
-        duration = f"{bars * BAR_INTERVAL_MIN} M"
-        bar_size = f"{BAR_INTERVAL_MIN} mins"
+
+        total_minutes = bars * BAR_INTERVAL_MIN           
+        total_seconds = total_minutes * 60                
+        max_seconds = 86400                               
+        duration_seconds = min(total_seconds, max_seconds)
+        duration = f"{int(duration_seconds)} S"           
+        bar_size = f"{BAR_INTERVAL_MIN} mins"             
 
         self._log(f"[BACKFILL] {symbol}: requesting {duration} of {bar_size} ending {end_dt}.")
         bars_data = self.ib.reqHistoricalData(
@@ -411,10 +416,11 @@ class PaperTrader:
                 }
             )
         df = pd.DataFrame(rows).set_index("datetime")
-        df = df[~df.index.duplicated(keep="last")].sortIndex()
+        df = df[~df.index.duplicated(keep="last")].sort_index()
         self.ohlcv_buffers[symbol] = df.tail(MAX_BUFFER_LENGTH)
         self._log(f"[BACKFILL] {symbol}: buffer now {len(df)} rows.")
 
+    
     def _backfill_buffers_on_startup(self) -> None:
         now = dt.datetime.utcnow()
         for sym in UNIVERSE:
