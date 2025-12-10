@@ -1,5 +1,11 @@
 """
-Paper trading strategy (IBKR, 5-min bars).
+Paper trading strategy (IBKR, 5-min bars):
+
+- Data: polls 5-min TRADES bars for UNIVERSE via reqHistoricalData.
+- Entry: ML classifier; open long if p_up >= P_UP_ENTRY_THRESHOLD and risk checks pass.
+- Exit: stop-loss on close, intrabar take-profit on high, or MAX_BARS_IN_TRADE.
+- Risk: size = RISK_PER_TRADE_FRACTION * equity / price, per-symbol cooldown after STOP,
+  and DAILY_LOSS_STOP_FRACTION to halt new entries.
 """
 import csv
 import datetime as dt
@@ -19,7 +25,9 @@ import numpy as np
 import pandas as pd
 from ib_insync import IB, MarketOrder, Stock, LimitOrder, StopOrder
 
-# === Config Imports ===
+# =================
+# Project config
+# =================
 try:
     from config import (
         UNIVERSE,
@@ -32,24 +40,50 @@ try:
         TAKE_PROFIT_PCT,
         MAX_CONCURRENT_POSITIONS,
         DAILY_LOSS_STOP_FRACTION,
-        RTH_START,
-        RTH_END,
-        RTH_TZ_NAME,
-        MAX_BUFFER_LENGTH,
-        ORDER_WAIT_TIMEOUT_SEC,
-        SMTP_CONFIG,
+        MAX_BARS_IN_TRADE,
+        COOLDOWN_BARS_AFTER_STOP,
     )
+    from quant.quant_model import build_features_for_symbol
+    from backtesting import load_latest_classifier
 except Exception as e:
-    raise RuntimeError(f"Failed to import config: {e}")
+    raise RuntimeError(f"Failed to import config or model modules: {e}")
 
-RTH_TZ = ZoneInfo(RTH_TZ_NAME) if RTH_TZ_NAME else None
-
-# === Logging Setup ===
+# ============
+# Constants
+# ============
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "paper_trade.log")
 TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
 
+STARTING_EQUITY = 100_000.0
+MAX_BUFFER_LENGTH = 500  # number of 5-min bars to keep in memory
+ORDER_WAIT_TIMEOUT_SEC = 15  # how long to wait for order fills
+
+# Email alert config (optional; no email if TRADER_ALERT_EMAIL_TO is unset)
+ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
+ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
+SMTP_HOST = os.environ.get("TRADER_SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("TRADER_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("TRADER_SMTP_USER")
+SMTP_PASS = os.environ.get("TRADER_SMTP_PASS")
+
+# Trading hours (Regular Trading Hours window for polling / entries)
+RTH_START = dt.time(9, 0)
+RTH_END = dt.time(16, 30)
+US_EQUITY_OPEN = dt.time(9, 30)
+US_EQUITY_OPEN_WARMUP_END = dt.time(9, 45)
+
+try:
+    RTH_TZ = ZoneInfo("America/New_York")
+except Exception:
+    RTH_TZ = None
+
+HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
+
+# ============
+# Logging setup
+# ============
 logger = logging.getLogger("paper_trade")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
@@ -69,11 +103,10 @@ hb_file = RotatingFileHandler(os.path.join(LOG_DIR, "heartbeat.log"), maxBytes=5
 hb_file.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 heartbeat_logger.addHandler(hb_file)
 
-STARTING_EQUITY = 100_000.0
 
-HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH = 60
-
-
+# ============
+# Helpers
+# ============
 def is_rth_now() -> bool:
     if RTH_TZ is not None:
         now = dt.datetime.now(RTH_TZ)
@@ -87,12 +120,15 @@ def minutes_until_next_rth_open() -> float:
         now = dt.datetime.now(RTH_TZ)
     else:
         now = dt.datetime.now()
+
     today_open = dt.datetime.combine(now.date(), RTH_START)
     if RTH_TZ is not None:
         today_open = today_open.replace(tzinfo=RTH_TZ)
+
     if now <= today_open:
         delta = today_open - now
         return max(delta.total_seconds() / 60.0, 0.0)
+
     tomorrow = now.date() + dt.timedelta(days=1)
     next_open = dt.datetime.combine(tomorrow, RTH_START)
     if RTH_TZ is not None:
@@ -122,27 +158,30 @@ class PaperTrader:
         self.last_stop_bar: Dict[str, pd.Timestamp] = {}
         self.trades_today: list[dict] = []
         self.current_trading_date: Optional[dt.date] = None
-        self.closed_trade_keys: set[tuple] = set()  # tracks already-closed trades
+        # NEW: prevent double-closing / double-logging the same trade
+        self.closed_trade_keys: set[tuple] = set()
 
     @staticmethod
     def _log(msg: str) -> None:
         logger.info(msg)
 
     def _send_email_alert(self, subject: str, body: str) -> None:
-        if not SMTP_CONFIG:
+        """Send a simple text email if TRADER_ALERT_EMAIL_TO is configured."""
+        if not ALERT_EMAIL_TO:
             return
         try:
             msg = MIMEText(body)
+            from_addr = ALERT_EMAIL_FROM or ALERT_EMAIL_TO
             msg["Subject"] = subject
-            msg["From"] = SMTP_CONFIG["from_addr"]
-            msg["To"] = SMTP_CONFIG["to_addr"]
+            msg["From"] = from_addr
+            msg["To"] = ALERT_EMAIL_TO
 
-            with smtplib.SMTP(SMTP_CONFIG["host"], SMTP_CONFIG["port"]) as server:
-                if SMTP_CONFIG.get("use_tls", False):
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                if SMTP_USER and SMTP_PASS:
                     server.starttls()
-                if SMTP_CONFIG.get("username"):
-                    server.login(SMTP_CONFIG["username"], SMTP_CONFIG["password"])
+                    server.login(SMTP_USER, SMTP_PASS)
                 server.send_message(msg)
+            self._log(f"[ALERT] Sent email to {ALERT_EMAIL_TO}.")
         except Exception as e:
             self._log(f"[EMAIL-ERROR] Failed to send email: {e}")
 
@@ -177,7 +216,9 @@ class PaperTrader:
                     for row in reader:
                         existing_key = tuple(str(row.get(k, "")) for k in key_fields)
                         if existing_key == new_key:
-                            self._log(f"[TRADE-LOG-SKIP] Duplicate trade detected for {rec['symbol']}, not appending to CSV.")
+                            self._log(
+                                f"[TRADE-LOG-SKIP] Duplicate trade detected for {rec['symbol']}, not appending to CSV."
+                            )
                             return
             except Exception as e:
                 self._log(f"[TRADE-LOG-ERROR] Failed to check CSV for duplicates: {e}")
@@ -211,8 +252,9 @@ class PaperTrader:
         if RTH_TZ is None:
             return False
         local = now_ts.tz_convert(RTH_TZ)
-        open_dt = dt.datetime.combine(local.date(), RTH_START).replace(tzinfo=RTH_TZ)
-        return dt.timedelta(0) <= (local - open_dt) <= dt.timedelta(minutes=30)
+        open_dt = dt.datetime.combine(local.date(), US_EQUITY_OPEN).replace(tzinfo=RTH_TZ)
+        warmup_end_dt = dt.datetime.combine(local.date(), US_EQUITY_OPEN_WARMUP_END).replace(tzinfo=RTH_TZ)
+        return open_dt <= local <= warmup_end_dt
 
     def _current_equity(self) -> float:
         try:
@@ -243,22 +285,29 @@ class PaperTrader:
         return max(size, 0)
 
     def _position_risk_ok(self, symbol: str, bar_time: pd.Timestamp) -> bool:
+        # 1. No duplicate positions per symbol
         if symbol in self.positions:
             return False
+
+        # 2. Daily loss stop
         if self._daily_loss_limit_hit():
             self._log("[RISK] Daily loss limit hit, not opening new positions.")
             return False
 
+        # 3. Avoid entering too close to market close
         if RTH_TZ is not None:
             local = bar_time.tz_convert(RTH_TZ)
-            if local.time() >= (dt.datetime.combine(local.date(), RTH_END) - dt.timedelta(minutes=10)).time():
+            close_dt = dt.datetime.combine(local.date(), RTH_END).replace(tzinfo=RTH_TZ)
+            if (close_dt - local) <= dt.timedelta(minutes=10):
                 self._log(f"[RISK] Skipping entries near close for {symbol}.")
                 return False
 
+        # 4. Max concurrent positions
         if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
             self._log(f"[RISK] Max concurrent positions reached ({MAX_CONCURRENT_POSITIONS})")
             return False
 
+        # 5. Cooldown after STOP (simple 3-bar cooldown)
         last_stop_ts = self.last_stop_bar.get(symbol)
         if last_stop_ts is not None:
             if (bar_time - last_stop_ts) < dt.timedelta(minutes=BAR_INTERVAL_MIN * 3):
@@ -284,6 +333,7 @@ class PaperTrader:
         else:
             raise RuntimeError("Could not connect to IBKR after multiple attempts.")
 
+        # Get start-of-day equity
         self._log("Fetching IBKR NetLiquidation for starting equity...")
         try:
             acc_vals = self.ib.accountValues()
@@ -295,18 +345,19 @@ class PaperTrader:
         except Exception as e:
             self._log(f"[WARN] Could not fetch NetLiquidation, using default {STARTING_EQUITY:.2f}: {e}")
 
+        # Load ML model
         self._log("Loading latest classifier...")
-        from backtesting import load_latest_classifier
-
         self.clf = load_latest_classifier(MODEL_DIR)
         self._log("Classifier loaded.")
 
+        # Build IB contracts
         self._log(f"Creating contracts for universe: {UNIVERSE}")
         for sym in UNIVERSE:
             self.contracts[sym] = Stock(sym, "SMART", "USD")
         self._log("Qualifying contracts...")
         self.ib.qualifyContracts(*self.contracts.values())
 
+        # Initialize buffers & backfill
         self._log("Initializing buffers...")
         for sym in UNIVERSE:
             self.ohlcv_buffers[sym] = self._empty_buffer()
@@ -360,7 +411,7 @@ class PaperTrader:
                 }
             )
         df = pd.DataFrame(rows).set_index("datetime")
-        df = df[~df.index.duplicated(keep="last")].sort_index()
+        df = df[~df.index.duplicated(keep="last")].sortIndex()
         self.ohlcv_buffers[symbol] = df.tail(MAX_BUFFER_LENGTH)
         self._log(f"[BACKFILL] {symbol}: buffer now {len(df)} rows.")
 
@@ -506,23 +557,18 @@ class PaperTrader:
         )
 
     def _maybe_enter_or_manage(self, symbol: str, bar_time: pd.Timestamp) -> None:
-        from quant_model import build_features_for_symbol
-
         buf = self.ohlcv_buffers[symbol]
         if len(buf) < 20:
             return
 
-        now = bar_time
+        # Gate by RTH and daily loss stop
         if not is_rth_now():
             return
-
         if self._daily_loss_limit_hit():
             return
 
-        from quant_model import build_features_for_symbol as build_features_for_symbol_internal
-
         try:
-            panel = build_features_for_symbol_internal(buf)
+            panel = build_features_for_symbol(buf)
         except Exception as e:
             self._log(f"[FEATURE-ERROR] {symbol}: {e}")
             return
@@ -541,6 +587,7 @@ class PaperTrader:
         if p_up > 0.5:
             self._log(f"[SIGNAL] {symbol}: p_up={p_up:.3f}")
 
+        # ========== Entry logic ==========
         if symbol not in self.positions:
             if p_up < P_UP_ENTRY_THRESHOLD:
                 return
@@ -566,6 +613,7 @@ class PaperTrader:
             )
             return
 
+        # ========== Exit logic (fallback, in case bracket doesn't fire) ==========
         pos = self.positions[symbol]
         stop_price = pos.entry_price * (1.0 - STOP_LOSS_PCT)
         tp_price = pos.entry_price * (1.0 + TAKE_PROFIT_PCT)
