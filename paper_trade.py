@@ -99,7 +99,11 @@ logger.addHandler(_file)
 heartbeat_logger = logging.getLogger("heartbeat")
 heartbeat_logger.setLevel(logging.INFO)
 heartbeat_logger.handlers.clear()
-hb_file = RotatingFileHandler(os.path.join(LOG_DIR, "heartbeat.log"), maxBytes=500_000, backupCount=2)
+hb_file = RotatingFileHandler(
+    os.path.join(LOG_DIR, "heartbeat.log"),
+    maxBytes=500_000,
+    backupCount=2,
+)
 hb_file.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 heartbeat_logger.addHandler(hb_file)
 
@@ -158,7 +162,7 @@ class PaperTrader:
         self.last_stop_bar: Dict[str, pd.Timestamp] = {}
         self.trades_today: list[dict] = []
         self.current_trading_date: Optional[dt.date] = None
-        # NEW: prevent double-closing / double-logging the same trade
+        # Prevent double-closing / double-logging the same trade
         self.closed_trade_keys: set[tuple] = set()
 
     @staticmethod
@@ -307,11 +311,12 @@ class PaperTrader:
             self._log(f"[RISK] Max concurrent positions reached ({MAX_CONCURRENT_POSITIONS})")
             return False
 
-        # 5. Cooldown after STOP (simple 3-bar cooldown)
+        # 5. Cooldown after STOP using config value
         last_stop_ts = self.last_stop_bar.get(symbol)
         if last_stop_ts is not None:
-            if (bar_time - last_stop_ts) < dt.timedelta(minutes=BAR_INTERVAL_MIN * 3):
-                self._log(f"[RISK] {symbol} in cooldown after STOP.")
+            cooldown_minutes = BAR_INTERVAL_MIN * COOLDOWN_BARS_AFTER_STOP
+            if (bar_time - last_stop_ts) < dt.timedelta(minutes=cooldown_minutes):
+                self._log(f"[RISK] {symbol} in cooldown after STOP ({COOLDOWN_BARS_AFTER_STOP} bars).")
                 return False
 
         return True
@@ -382,12 +387,13 @@ class PaperTrader:
     def _backfill_symbol(self, symbol: str, end_dt: dt.datetime, bars: int = MAX_BUFFER_LENGTH) -> None:
         contract = self.contracts[symbol]
 
-        total_minutes = bars * BAR_INTERVAL_MIN           
-        total_seconds = total_minutes * 60                
-        max_seconds = 86400                               
+        # Seconds-based backfill, capped at 86400 S per IB limits
+        total_minutes = bars * BAR_INTERVAL_MIN
+        total_seconds = total_minutes * 60
+        max_seconds = 86400
         duration_seconds = min(total_seconds, max_seconds)
-        duration = f"{int(duration_seconds)} S"           
-        bar_size = f"{BAR_INTERVAL_MIN} mins"             
+        duration = f"{int(duration_seconds)} S"
+        bar_size = f"{BAR_INTERVAL_MIN} mins"
 
         self._log(f"[BACKFILL] {symbol}: requesting {duration} of {bar_size} ending {end_dt}.")
         bars_data = self.ib.reqHistoricalData(
@@ -420,7 +426,6 @@ class PaperTrader:
         self.ohlcv_buffers[symbol] = df.tail(MAX_BUFFER_LENGTH)
         self._log(f"[BACKFILL] {symbol}: buffer now {len(df)} rows.")
 
-    
     def _backfill_buffers_on_startup(self) -> None:
         now = dt.datetime.utcnow()
         for sym in UNIVERSE:
@@ -473,10 +478,11 @@ class PaperTrader:
 
     def _poll_symbol(self, symbol: str) -> None:
         contract = self.contracts[symbol]
+        # Request 1 trading day of 5-min bars, we use only the last bar
         bars = self.ib.reqHistoricalData(
             contract,
             endDateTime="",
-            durationStr=f"{BAR_INTERVAL_MIN} M",
+            durationStr="1 D",
             barSizeSetting=f"{BAR_INTERVAL_MIN} mins",
             whatToShow="TRADES",
             useRTH=True,
@@ -531,7 +537,14 @@ class PaperTrader:
         self._log(f"[ORDER-FILLED] {action} {abs(size)} {symbol} avg={avg_price:.4f}")
         return SimpleNamespace(avg_price=avg_price, size=size, action=action, raw_trade=trade)
 
-    def _place_bracket_order(self, symbol: str, size: int, p_up: float, current_price: float, bar_time: pd.Timestamp):
+    def _place_bracket_order(
+        self,
+        symbol: str,
+        size: int,
+        p_up: float,
+        current_price: float,
+        bar_time: pd.Timestamp,
+    ):
         contract = self.contracts[symbol]
         stop_price = round(current_price * (1.0 - STOP_LOSS_PCT), 2)
         tp_price = round(current_price * (1.0 + TAKE_PROFIT_PCT), 2)
@@ -590,19 +603,27 @@ class PaperTrader:
         x = feat_vals.to_frame().T
         p_up = float(self.clf.predict_proba(x)[0, 1])
 
+        # Always log p_up + threshold for debugging
+        self._log(f"[PUP] {symbol}: p_up={p_up:.3f}, thresh={P_UP_ENTRY_THRESHOLD:.3f}")
+
         if p_up > 0.5:
             self._log(f"[SIGNAL] {symbol}: p_up={p_up:.3f}")
 
         # ========== Entry logic ==========
         if symbol not in self.positions:
             if p_up < P_UP_ENTRY_THRESHOLD:
+                self._log(
+                    f"[ENTRY-SKIP] {symbol}: p_up={p_up:.3f} < thresh={P_UP_ENTRY_THRESHOLD:.3f}"
+                )
                 return
             if not self._position_risk_ok(symbol, bar_time):
+                self._log(f"[ENTRY-SKIP] {symbol}: risk checks failed.")
                 return
 
             current_price = float(buf["close"].iloc[-1])
             size = self._calc_position_size(current_price)
             if size <= 0:
+                self._log(f"[ENTRY-SKIP] {symbol}: size calc <= 0 at price {current_price:.4f}")
                 return
 
             bracket = self._place_bracket_order(symbol, size, p_up, current_price, bar_time)
@@ -632,7 +653,14 @@ class PaperTrader:
             self._log(f"[TAKE-PROFIT] {symbol} at price {current_price:.4f}")
             self._close_position(symbol, pos, current_price, bar_time, reason="TAKE_PROFIT")
 
-    def _close_position(self, symbol: str, pos: Position, exit_price: float, exit_ts: pd.Timestamp, reason: str) -> None:
+    def _close_position(
+        self,
+        symbol: str,
+        pos: Position,
+        exit_price: float,
+        exit_ts: pd.Timestamp,
+        reason: str,
+    ) -> None:
         """
         Close a position once (idempotent), cancel any pending orders, and log the result.
         """
@@ -758,33 +786,61 @@ class PaperTrader:
         self._log("Starting polling loop...")
 
         while True:
-            if not is_rth_now():
-                min_to_open = minutes_until_next_rth_open()
-                sleep_min = min(min_to_open, HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH)
-                sleep_min = max(1.0, sleep_min)
-                heartbeat_logger.info(f"[HEARTBEAT] Outside RTH. Sleeping {sleep_min:.1f} min.")
-                if self.ib and self.ib.isConnected():
-                    self.ib.sleep(sleep_min * 60)
-                else:
-                    time.sleep(sleep_min * 60)
-                continue
-
-            if not self._ensure_ib_connected():
-                heartbeat_logger.info("[HEARTBEAT] IB disconnected, retrying in 60s.")
-                time.sleep(60)
-                continue
-
-            start = dt.datetime.now()
             try:
-                self._poll_bars_once()
-                self._log_open_positions()
-            except Exception as e:
-                self._log(f"[ERROR] Polling loop: {e}")
+                # ===== 1) Outside RTH: just heartbeat + sleep =====
+                if not is_rth_now():
+                    min_to_open = minutes_until_next_rth_open()
+                    sleep_min = min(min_to_open, HEARTBEAT_INTERVAL_MIN_OUTSIDE_RTH)
+                    sleep_min = max(1.0, sleep_min)
+                    msg = f"[HEARTBEAT] Outside RTH. Sleeping {sleep_min:.1f} min."
+                    heartbeat_logger.info(msg)
+                    self._log(msg)
 
-            elapsed = (dt.datetime.now() - start).total_seconds()
-            sleep_sec = max(1.0, (BAR_INTERVAL_MIN * 60) - elapsed)
-            self._log(f"[LOOP] Done in {elapsed:.1f}s. Sleeping {sleep_sec:.1f}s.")
-            self.ib.sleep(sleep_sec)
+                    if self.ib and self.ib.isConnected():
+                        try:
+                            self.ib.sleep(sleep_min * 60)
+                        except ConnectionError as ce:
+                            self._log(f"[IB-CONNECTION] Sleep interrupted outside RTH: {ce}")
+                            time.sleep(sleep_min * 60)
+                    else:
+                        time.sleep(sleep_min * 60)
+                    continue
+
+                # ===== 2) Inside RTH: make sure we're connected =====
+                if not self._ensure_ib_connected():
+                    heartbeat_logger.info("[HEARTBEAT] IB disconnected, retrying in 60s.")
+                    self._log("[IB-CONNECTION] Not connected at loop start, sleeping 60s.")
+                    time.sleep(60)
+                    continue
+
+                # ===== 3) Work: poll data, maybe trade, log positions =====
+                start = dt.datetime.now()
+                try:
+                    self._poll_bars_once()
+                    self._log_open_positions()
+                except Exception as e:
+                    self._log(f"[ERROR] Polling loop: {e}")
+                    self._log(traceback.format_exc())
+
+                elapsed = (dt.datetime.now() - start).total_seconds()
+                sleep_sec = max(1.0, (BAR_INTERVAL_MIN * 60) - elapsed)
+                self._log(f"[LOOP] Done in {elapsed:.1f}s. Sleeping {sleep_sec:.1f}s.")
+
+                # ===== 4) Sleep in a way that survives socket disconnect =====
+                if self.ib and self.ib.isConnected():
+                    try:
+                        self.ib.sleep(sleep_sec)
+                    except ConnectionError as ce:
+                        self._log(f"[IB-CONNECTION] Sleep interrupted in RTH: {ce}")
+                        time.sleep(sleep_sec)
+                else:
+                    time.sleep(sleep_sec)
+
+            except Exception as e:
+                # Catch-all so the loop never dies from unexpected errors
+                self._log(f"[ERROR] Main run loop exception: {e}")
+                self._log(traceback.format_exc())
+                time.sleep(10)
 
 
 def main() -> None:

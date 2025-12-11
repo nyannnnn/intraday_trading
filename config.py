@@ -25,7 +25,7 @@ LABEL_UP_THRESHOLD = 0.006      # +0.6% threshold for "up" label
 # Trading / risk config
 # =====================
 
-P_UP_ENTRY_THRESHOLD = 0.00      # ML probability threshold to enter long
+P_UP_ENTRY_THRESHOLD = 0.55      # ML probability threshold to enter long
 MAX_CONCURRENT_POSITIONS = 5    # max open trades at once
 RISK_PER_TRADE_FRACTION = 0.015   # 1.5% of total capital risked per trade
 STOP_LOSS_PCT = 0.02             # 2% down
