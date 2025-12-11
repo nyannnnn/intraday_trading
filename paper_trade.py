@@ -18,12 +18,12 @@ from dataclasses import dataclass
 from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from types import SimpleNamespace
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from ib_insync import IB, MarketOrder, Stock, LimitOrder, StopOrder
+from ib_insync import IB, MarketOrder, Stock, LimitOrder, StopOrder, Trade
 
 # =================
 # Project config
@@ -58,9 +58,9 @@ TRADES_CSV_PATH = os.path.join(LOG_DIR, "paper_trades.csv")
 
 STARTING_EQUITY = 100_000.0
 MAX_BUFFER_LENGTH = 500  # number of 5-min bars to keep in memory
-ORDER_WAIT_TIMEOUT_SEC = 15  # how long to wait for order fills
+ORDER_WAIT_TIMEOUT_SEC = 15  # how long to wait for order fills before checking status
 
-# Email alert config (optional; no email if TRADER_ALERT_EMAIL_TO is unset)
+# Email alert config
 ALERT_EMAIL_TO = os.environ.get("TRADER_ALERT_EMAIL_TO")
 ALERT_EMAIL_FROM = os.environ.get("TRADER_ALERT_EMAIL_FROM")
 SMTP_HOST = os.environ.get("TRADER_SMTP_HOST", "smtp.gmail.com")
@@ -68,7 +68,7 @@ SMTP_PORT = int(os.environ.get("TRADER_SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("TRADER_SMTP_USER")
 SMTP_PASS = os.environ.get("TRADER_SMTP_PASS")
 
-# Trading hours (Regular Trading Hours window for polling / entries)
+# Trading hours
 RTH_START = dt.time(9, 0)
 RTH_END = dt.time(16, 30)
 US_EQUITY_OPEN = dt.time(9, 30)
@@ -252,14 +252,6 @@ class PaperTrader:
     def _ib_now(self) -> pd.Timestamp:
         return self._normalize_ts(pd.Timestamp.utcnow())
 
-    def _is_within_open_warmup(self, now_ts: pd.Timestamp) -> bool:
-        if RTH_TZ is None:
-            return False
-        local = now_ts.tz_convert(RTH_TZ)
-        open_dt = dt.datetime.combine(local.date(), US_EQUITY_OPEN).replace(tzinfo=RTH_TZ)
-        warmup_end_dt = dt.datetime.combine(local.date(), US_EQUITY_OPEN_WARMUP_END).replace(tzinfo=RTH_TZ)
-        return open_dt <= local <= warmup_end_dt
-
     def _current_equity(self) -> float:
         try:
             if self.ib is None or not self.ib.isConnected():
@@ -386,8 +378,6 @@ class PaperTrader:
 
     def _backfill_symbol(self, symbol: str, end_dt: dt.datetime, bars: int = MAX_BUFFER_LENGTH) -> None:
         contract = self.contracts[symbol]
-
-        # Seconds-based backfill, capped at 86400 S per IB limits
         total_minutes = bars * BAR_INTERVAL_MIN
         total_seconds = total_minutes * 60
         max_seconds = 86400
@@ -443,10 +433,6 @@ class PaperTrader:
             self._log(f"[IB-POSITIONS-ERROR] {e}")
             return
 
-        if not open_positions:
-            self._log("[RESCUE] No existing IBKR positions at startup.")
-            return
-
         for p in open_positions:
             sym = p.contract.symbol
             if sym not in UNIVERSE:
@@ -464,6 +450,35 @@ class PaperTrader:
             self.positions[sym] = pos
             self._log(f"[RESCUE] {sym}: restored position size={size} entry_price={avg_price:.4f}")
 
+    def _reconcile_positions(self) -> None:
+        """Syncs local state with actual IBKR positions to fix drift/zombie trades."""
+        if not self.ib or not self.ib.isConnected():
+            return
+        
+        try:
+            actual_positions = self.ib.positions()
+            # Convert to dict for easy lookup: symbol -> Position
+            ib_pos_map = {p.contract.symbol: p for p in actual_positions if p.position != 0}
+            
+            # 1. Remove locals that don't exist in IB (they were closed manually or stopped out)
+            for sym in list(self.positions.keys()):
+                if sym not in ib_pos_map:
+                    self._log(f"[SYNC] {sym} absent in IBKR but present locally. Removing local.")
+                    del self.positions[sym]
+
+            # 2. Add IB positions that aren't local (orphans/manual trades)
+            for sym, p in ib_pos_map.items():
+                if sym in UNIVERSE and sym not in self.positions:
+                    self._log(f"[SYNC] {sym} found in IBKR but not locally. Adopting.")
+                    self.positions[sym] = Position(
+                        symbol=sym,
+                        size=int(p.position),
+                        entry_price=float(p.avgCost),
+                        entry_dt=self._ib_now() # Best guess
+                    )
+        except Exception as e:
+            self._log(f"[SYNC-ERROR] Failed to reconcile positions: {e}")
+
     def _poll_bars_once(self) -> None:
         if not self._ensure_ib_connected():
             raise RuntimeError("IB connection lost and could not reconnect.")
@@ -478,7 +493,6 @@ class PaperTrader:
 
     def _poll_symbol(self, symbol: str) -> None:
         contract = self.contracts[symbol]
-        # Request 1 trading day of 5-min bars, we use only the last bar
         bars = self.ib.reqHistoricalData(
             contract,
             endDateTime="",
@@ -515,27 +529,34 @@ class PaperTrader:
             self._log(f"[WARN] Bar {symbol} has no tzinfo: {bar_ts}")
         self._maybe_enter_or_manage(symbol, bar_ts)
 
-    def _submit_market_order(self, symbol: str, size: int) -> Optional[SimpleNamespace]:
-        contract = self.contracts[symbol]
-        action = "BUY" if size > 0 else "SELL"
-        order = MarketOrder(action, abs(size))
+    def _execute_order_robust(self, contract, order, timeout=15) -> Trade:
+        """
+        Places an order and waits for it to complete. 
+        Returns the Trade object. Does NOT panic on timeout if status is Submitted.
+        """
         trade = self.ib.placeOrder(contract, order)
-        self._log(f"[ORDER] {action} {abs(size)} {symbol} as market order submitted.")
+        self.ib.sleep(0.5)  # Initial wait
+        
+        start_time = time.time()
+        while not trade.isDone():
+            self.ib.sleep(0.5)
+            if time.time() - start_time > timeout:
+                break
+        
+        # Log status if slow/failed
+        if not trade.isDone():
+            status = trade.orderStatus.status
+            if status in ['PreSubmitted', 'Submitted']:
+                self._log(f"[ORDER-SLOW] {contract.symbol} {order.action} still {status} after {timeout}s.")
+            else:
+                self._log(f"[ORDER-TIMEOUT] {contract.symbol} {order.action} status: {status}")
+        else:
+            if trade.orderStatus.status == 'Filled':
+                 self._log(f"[ORDER-FILLED] {contract.symbol} {order.action} {trade.filled()} at {trade.orderStatus.avgFillPrice:.4f}")
+            else:
+                 self._log(f"[ORDER-DONE-OTHER] {contract.symbol} status: {trade.orderStatus.status}")
 
-        elapsed = 0.0
-        while not trade.isDone() and elapsed < ORDER_WAIT_TIMEOUT_SEC:
-            self.ib.waitOnUpdate(timeout=1)
-            elapsed += 0.5
-        fills = trade.fills
-        if not fills:
-            self._log("[ORDER] No fills received.")
-            return None
-        total_shares = sum(abs(f.execution.shares) for f in fills)
-        if total_shares == 0:
-            return None
-        avg_price = sum(f.execution.price * abs(f.execution.shares) for f in fills) / total_shares
-        self._log(f"[ORDER-FILLED] {action} {abs(size)} {symbol} avg={avg_price:.4f}")
-        return SimpleNamespace(avg_price=avg_price, size=size, action=action, raw_trade=trade)
+        return trade
 
     def _place_bracket_order(
         self,
@@ -662,9 +683,16 @@ class PaperTrader:
         reason: str,
     ) -> None:
         """
-        Close a position once (idempotent), cancel any pending orders, and log the result.
+        Close a position safely. Only marks as closed if fills are confirmed.
         """
-        # --- 0) Idempotency guard: skip if we've already closed this economic trade ---
+        # --- 0) Check if we already have an active exit order to avoid duplicates ---
+        open_trades = self.ib.openTrades()
+        for t in open_trades:
+            if t.contract.symbol == symbol and t.order.action == 'SELL' and not t.isDone():
+                self._log(f"[EXIT-PENDING] {symbol}: Exit order {t.order.orderId} is active. Waiting.")
+                return
+
+        # --- 1) Idempotency guard for COMPLETED trades ---
         trade_key = (
             symbol,
             float(pos.entry_price),
@@ -674,25 +702,29 @@ class PaperTrader:
         if trade_key in self.closed_trade_keys:
             self._log(f"[EXIT-SKIP] {symbol}: trade already closed, skipping duplicate.")
             return
-        self.closed_trade_keys.add(trade_key)
 
-        # 1. Cancel any open orders for this symbol (cleanup bracket children)
+        # --- 2) Cancel any existing open orders (like old brackets) ---
         for t in self.ib.openTrades():
             if t.contract.symbol == symbol:
                 self.ib.cancelOrder(t.order)
 
-        # 2. If the exit reason is NOT 'BRACKET_HIT', we need to send a market sell.
+        # --- 3) Execute Market Sell ---
         if reason != "BRACKET_HIT":
-            size = pos.size
-            fills = self._submit_market_order(symbol, -size)
-            if fills is None:
-                self._log(f"[EXIT-FAILED] {symbol}: no fills on close.")
+            contract = self.contracts[symbol]
+            order = MarketOrder("SELL", pos.size)
+            trade = self._execute_order_robust(contract, order, timeout=ORDER_WAIT_TIMEOUT_SEC)
+            
+            # If trade is NOT filled (e.g., just Submitted), we return and let the loop check again later.
+            # The order is live at IB, so we don't need to resubmit.
+            if trade.orderStatus.status != 'Filled':
+                self._log(f"[EXIT-WAIT] {symbol}: Sell order status is {trade.orderStatus.status}. Position remains open locally.")
                 return
-            realized_price = fills.avg_price
+                
+            realized_price = trade.orderStatus.avgFillPrice
         else:
             realized_price = exit_price
 
-        # 3. Calculate PnL (R-multiple based on fixed % stop distance)
+        # --- 4) Calculate PnL (Only reachable if Filled) ---
         realized = (realized_price - pos.entry_price) * pos.size
         r_multiple = realized / (STOP_LOSS_PCT * pos.entry_price * pos.size)
         self.realized_pnl_today += realized
@@ -700,7 +732,7 @@ class PaperTrader:
         if reason == "STOP":
             self.last_stop_bar[symbol] = exit_ts
 
-        # 4. Log & record trade
+        # --- 5) Log & Cleanup ---
         trade_record = {
             "symbol": symbol,
             "entry_dt": pos.entry_dt,
@@ -716,9 +748,12 @@ class PaperTrader:
         self._append_trade_to_csv(trade_record)
         self._log(f"[EXIT-{reason}] {symbol}: pnl={realized:.2f}, R={r_multiple:.2f}")
 
-        # 5. Remove from local tracking
+        # Remove from local tracking
         if symbol in self.positions:
             del self.positions[symbol]
+        
+        # Mark as closed to prevent future processing of this specific trade instance
+        self.closed_trade_keys.add(trade_key)
 
     def _maybe_roll_trading_date(self, now_ts: pd.Timestamp) -> None:
         today = now_ts.date()
@@ -771,7 +806,6 @@ class PaperTrader:
             if buf is not None and not buf.empty:
                 last_price = float(buf["close"].iloc[-1])
             else:
-                # Fallback: no recent bar, assume flat PnL
                 last_price = float(pos.entry_price)
 
             open_pnl = (last_price - pos.entry_price) * pos.size
@@ -813,9 +847,10 @@ class PaperTrader:
                     time.sleep(60)
                     continue
 
-                # ===== 3) Work: poll data, maybe trade, log positions =====
+                # ===== 3) Work: Sync, poll, trade, log =====
                 start = dt.datetime.now()
                 try:
+                    self._reconcile_positions()  # <--- CRITICAL FIX: Keep in sync with IB
                     self._poll_bars_once()
                     self._log_open_positions()
                 except Exception as e:
@@ -826,7 +861,7 @@ class PaperTrader:
                 sleep_sec = max(1.0, (BAR_INTERVAL_MIN * 60) - elapsed)
                 self._log(f"[LOOP] Done in {elapsed:.1f}s. Sleeping {sleep_sec:.1f}s.")
 
-                # ===== 4) Sleep in a way that survives socket disconnect =====
+                # ===== 4) Sleep safely =====
                 if self.ib and self.ib.isConnected():
                     try:
                         self.ib.sleep(sleep_sec)
@@ -837,7 +872,6 @@ class PaperTrader:
                     time.sleep(sleep_sec)
 
             except Exception as e:
-                # Catch-all so the loop never dies from unexpected errors
                 self._log(f"[ERROR] Main run loop exception: {e}")
                 self._log(traceback.format_exc())
                 time.sleep(10)
